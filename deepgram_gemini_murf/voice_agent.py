@@ -266,7 +266,7 @@ class TranscriptLogger(FrameProcessor):
         if isinstance(frame, TranscriptionFrame):
             logger.info(f"[STT final]   {frame.text!r}")
         elif isinstance(frame, InterimTranscriptionFrame):
-            logger.debug(f"[STT interim] {frame.text!r}")
+            logger.info(f"[STT interim] {frame.text!r}")
         await self.push_frame(frame, direction)
 
 
@@ -751,7 +751,7 @@ def _build_aggregators(vad: Optional[SileroVADAnalyzer], context: LLMContext, is
             user_turn_strategies=UserTurnStrategies(
                 stop=[stop_strategy],
             ),
-            user_mute_strategies=[FirstSpeechUserMuteStrategy()],
+            user_mute_strategies=[],
         ),
     )
 
@@ -817,6 +817,8 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
     vad = _build_vad() if use_local_vad else None
     stt = _build_deepgram_stt(pc_lang)
     llm = _build_google_llm(config.system_instruction)
+    if hasattr(llm, "_ensure_cache"):
+        asyncio.create_task(llm._ensure_cache())
     tts_service = _build_murf_tts(
         config.voice, pc_lang, config.speaking_rate
     )
@@ -834,6 +836,14 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
         )
     context = LLMContext(messages=initial_messages, tools=tools)
     user_aggregator, assistant_aggregator = _build_aggregators(vad, context)
+
+    @user_aggregator.event_handler("on_user_turn_stopped")
+    async def on_user_turn_stopped(aggregator, strategy, message):
+        logger.info(f"[Context User] Aggregated user turn text: {message.content!r}")
+
+    @assistant_aggregator.event_handler("on_assistant_turn_stopped")
+    async def on_assistant_turn_stopped(aggregator, message):
+        logger.info(f"[Context Assistant] Aggregated assistant turn text: {message.content!r}")
 
     metrics_accumulator = CallMetricsAccumulator()
     transcript_logger = TranscriptLogger()
