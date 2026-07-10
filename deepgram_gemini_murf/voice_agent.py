@@ -352,7 +352,7 @@ def _build_deepgram_stt(language: Language) -> DeepgramSTTService:
         dg_language = dg_language_env
         logger.info(f"[deepgram] using DEEPGRAM_LANGUAGE={dg_language!r} (env override)")
     else:
-        dg_language = "multi"
+        dg_language = language.value
         logger.info(
             f"[deepgram] no DEEPGRAM_LANGUAGE set; defaulting to {dg_language!r} "
             f"(call language was {language.value!r})"

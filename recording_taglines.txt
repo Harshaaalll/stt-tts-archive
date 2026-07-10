@@ -1,0 +1,15 @@
+Experiment Taglines Dictionary
+
+This file tracks the taglines for recording files and maps them to the exact optimization config.
+
+Tagline: no_vad_sg_nomute
+Description: Local VAD disabled (USE_LOCAL_VAD=false), Gemini hosted in Singapore (asia-southeast1), greeting user mute strategy removed (allowing greeting barge-in), and prompt cache pre-warmed in the background.
+
+Tagline: local_vad_us
+Description: Original baseline: Silero local VAD + Turn Analyzer enabled, Gemini hosted in us-central1, first-speech user mute strategy active.
+
+Tagline: no_vad_us_mute
+Description: Local VAD disabled (USE_LOCAL_VAD=false), Gemini hosted in us-central1 (US), but greeting barge-in is still muted (FirstSpeechUserMuteStrategy active).
+
+Tagline: dg_lang_hi
+Description: Deepgram STT forced to call language 'hi' instead of 'multi' to reduce language-detection errors and latency.
