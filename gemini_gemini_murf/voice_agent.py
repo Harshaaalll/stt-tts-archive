@@ -279,6 +279,63 @@ class CallMetricsAccumulator(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class LatencyTimeline:
+    """Per-turn latency timeline; resets on each new user speech start."""
+
+    def __init__(self):
+        self.t0: Optional[float] = None
+        self.turn_id: int = 0
+        self.marked: set = set()
+
+    def reset(self):
+        self.turn_id += 1
+        self.t0 = None
+        self.marked = set()
+
+    def mark(self, key: str, extra: str = ""):
+        if key in self.marked:
+            return
+        now = time.time()
+        if self.t0 is None:
+            self.t0 = now
+        rel_ms = (now - self.t0) * 1000.0
+        self.marked.add(key)
+        suffix = f" {extra}" if extra else ""
+        logger.info(f"[latency turn={self.turn_id}] {key} +{rel_ms:.0f}ms{suffix}")
+
+
+class LatencyTracer(FrameProcessor):
+    """Observes frames flowing past a pipeline position and marks stage timestamps."""
+
+    def __init__(self, timeline: LatencyTimeline, **kwargs):
+        super().__init__(**kwargs)
+        self.timeline = timeline
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        name = type(frame).__name__
+        if name == "UserStartedSpeakingFrame":
+            self.timeline.reset()
+        elif name in ("UserStoppedSpeakingFrame", "VADUserStoppedSpeakingFrame"):
+            self.timeline.mark("user_stopped_speaking")
+        elif name == "TranscriptionFrame":
+            text = getattr(frame, "text", "") or ""
+            self.timeline.mark("stt_final", f"text={text[:40]!r}")
+        elif name == "LLMContextFrame":
+            self.timeline.mark("llm_request_sent")
+        elif name == "LLMFullResponseStartFrame":
+            self.timeline.mark("llm_response_start")
+        elif name == "LLMTextFrame":
+            self.timeline.mark("llm_first_token")
+        elif name == "TTSStartedFrame":
+            self.timeline.mark("tts_started")
+        elif name == "TTSAudioRawFrame":
+            self.timeline.mark("tts_first_audio")
+        elif name == "BotStartedSpeakingFrame":
+            self.timeline.mark("bot_started_speaking")
+        await self.push_frame(frame, direction)
+
+
 class TextNormalizerProcessor(FrameProcessor):
     def __init__(self, language: str, **kwargs):
         super().__init__(**kwargs)
@@ -793,6 +850,7 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
 
     @user_aggregator.event_handler("on_user_turn_stopped")
     async def on_user_turn_stopped(aggregator, strategy, message):
+        timeline.mark("smart_turn_aggregation_complete")
         logger.info(f"[Context User] Aggregated user turn text: {message.content!r}")
 
     @assistant_aggregator.event_handler("on_assistant_turn_stopped")
@@ -801,6 +859,10 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
 
     metrics_accumulator = CallMetricsAccumulator()
     transcript_logger = TranscriptLogger()
+    timeline = LatencyTimeline()
+    tracer_stt = LatencyTracer(timeline)
+    tracer_agg = LatencyTracer(timeline)
+    tracer_tts = LatencyTracer(timeline)
     
 
     idle_retry_count = {"n": 0}
@@ -824,10 +886,13 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
         transport.input(),
         stt,
         transcript_logger,
+        tracer_stt,
         user_aggregator,
+        tracer_agg,
         llm,
         text_normalizer,
         tts_service,
+        tracer_tts,
     ]
 
     stages.extend([
