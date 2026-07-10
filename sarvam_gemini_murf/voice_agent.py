@@ -374,6 +374,27 @@ def _require_env(name: str) -> str:
     return val
 
 
+_DEFAULT_FILLER_PHRASES = ["ठीक है।", "एक सेकंड।", "हम्म।", "अच्छा।"]
+
+
+def _get_filler_config():
+    enabled = os.getenv("FILLER_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+    try:
+        min_chars = int(os.getenv("FILLER_MIN_USER_CHARS", "15"))
+    except ValueError:
+        min_chars = 15
+    phrases = list(_DEFAULT_FILLER_PHRASES)
+    phrases_env = os.getenv("FILLER_PHRASES")
+    if phrases_env:
+        try:
+            parsed = json.loads(phrases_env)
+            if isinstance(parsed, list) and parsed and all(isinstance(p, str) for p in parsed):
+                phrases = parsed
+        except json.JSONDecodeError:
+            pass
+    return enabled, min_chars, phrases
+
+
 def _get_bool_env(name: str, default: bool) -> bool:
     val = os.getenv(name)
     if val is None:
@@ -845,10 +866,25 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
     context = LLMContext(messages=initial_messages, tools=tools)
     user_aggregator, assistant_aggregator = _build_aggregators(vad, context)
 
+    filler_enabled, filler_min_chars, filler_phrases = _get_filler_config()
+    filler_state = {"last_index": -1}
+    logger.info(
+        f"[filler] enabled={filler_enabled} min_chars={filler_min_chars} "
+        f"phrases={filler_phrases}"
+    )
+
     @user_aggregator.event_handler("on_user_turn_stopped")
     async def on_user_turn_stopped(aggregator, strategy, message):
         timeline.mark("smart_turn_aggregation_complete")
         logger.info(f"[Context User] Aggregated user turn text: {message.content!r}")
+        if filler_enabled and filler_phrases:
+            text = (message.content or "").strip()
+            if len(text) >= filler_min_chars:
+                idx = (filler_state["last_index"] + 1) % len(filler_phrases)
+                filler_state["last_index"] = idx
+                phrase = filler_phrases[idx]
+                logger.info(f"[filler] queueing {phrase!r} (user_text_len={len(text)})")
+                await aggregator.push_frame(TTSSpeakFrame(text=phrase))
 
     @assistant_aggregator.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message):
