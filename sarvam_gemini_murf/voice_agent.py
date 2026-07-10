@@ -280,6 +280,84 @@ class CallMetricsAccumulator(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class LLMOutputSanitizer(FrameProcessor):
+    """Strip `<speech>`/`</speech>` tags and drop `<start_of_turn>...` blocks
+    from the streaming LLM text before it reaches TTS. Buffers a small tail
+    so tag delimiters split across frames are still recognized.
+    """
+
+    _STRIP_TAGS = ("<speech>", "</speech>")
+    _SUPPRESS_OPEN = "<start_of_turn>"
+    _SUPPRESS_CLOSE = "</start_of_turn>"
+    _MAX_HOLD = 20
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._buf = ""
+        self._suppress = False
+
+    def _consume(self, chunk: str, is_final: bool) -> str:
+        self._buf += chunk
+        out = []
+        while self._buf:
+            if self._suppress:
+                idx = self._buf.find(self._SUPPRESS_CLOSE)
+                if idx >= 0:
+                    self._buf = self._buf[idx + len(self._SUPPRESS_CLOSE):]
+                    self._suppress = False
+                    continue
+                if is_final:
+                    self._buf = ""
+                break
+            lt = self._buf.find("<")
+            if lt < 0:
+                out.append(self._buf)
+                self._buf = ""
+                break
+            if lt > 0:
+                out.append(self._buf[:lt])
+                self._buf = self._buf[lt:]
+            matched = False
+            for tag in self._STRIP_TAGS:
+                if self._buf.startswith(tag):
+                    self._buf = self._buf[len(tag):]
+                    matched = True
+                    break
+            if matched:
+                continue
+            if self._buf.startswith(self._SUPPRESS_OPEN):
+                self._buf = self._buf[len(self._SUPPRESS_OPEN):]
+                self._suppress = True
+                continue
+            if ">" not in self._buf and len(self._buf) < self._MAX_HOLD and not is_final:
+                break
+            out.append("<")
+            self._buf = self._buf[1:]
+        return "".join(out)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        name = type(frame).__name__
+        if name == "LLMTextFrame":
+            cleaned = self._consume(getattr(frame, "text", "") or "", is_final=False)
+            if cleaned:
+                try:
+                    frame.text = cleaned
+                    await self.push_frame(frame, direction)
+                except Exception:
+                    from pipecat.frames.frames import LLMTextFrame as _LLMTextFrame
+                    await self.push_frame(_LLMTextFrame(text=cleaned), direction)
+            return
+        if name == "LLMFullResponseEndFrame":
+            tail = self._consume("", is_final=True)
+            if tail:
+                from pipecat.frames.frames import LLMTextFrame as _LLMTextFrame
+                await self.push_frame(_LLMTextFrame(text=tail), direction)
+            self._buf = ""
+            self._suppress = False
+        await self.push_frame(frame, direction)
+
+
 class LatencyTimeline:
     """Per-turn latency timeline; resets on each new user speech start."""
 
@@ -684,6 +762,8 @@ class CachingGoogleVertexLLMService(GoogleVertexLLMService):
                     pass
             yield chunk
 
+    _gen_params_logged = False
+
     def _build_generation_params(
         self,
         system_instruction=None,
@@ -697,12 +777,31 @@ class CachingGoogleVertexLLMService(GoogleVertexLLMService):
                 tool_config=None,
             )
             params["cached_content"] = self._cached_content_name
-            return params
-        return super()._build_generation_params(
-            system_instruction=system_instruction,
-            tools=tools,
-            tool_config=tool_config,
-        )
+        else:
+            params = super()._build_generation_params(
+                system_instruction=system_instruction,
+                tools=tools,
+                tool_config=tool_config,
+            )
+        thinking = self._settings.thinking
+        if thinking is not None and hasattr(thinking, "model_dump") and "thinking_config" not in params:
+            try:
+                params["thinking_config"] = thinking.model_dump(exclude_unset=True)
+            except Exception:
+                pass
+        extra = getattr(self._settings, "extra", None) or {}
+        if "stop_sequences" in extra and "stop_sequences" not in params:
+            params["stop_sequences"] = extra["stop_sequences"]
+        if not CachingGoogleVertexLLMService._gen_params_logged:
+            CachingGoogleVertexLLMService._gen_params_logged = True
+            logged = {
+                k: (v if k in ("thinking_config", "stop_sequences", "max_output_tokens",
+                               "temperature", "top_p", "top_k", "cached_content")
+                    else f"<{type(v).__name__}>")
+                for k, v in params.items()
+            }
+            logger.info(f"[vertex-gen-params] {logged}")
+        return params
 
 
 def _build_google_llm(system_instruction: str) -> GoogleVertexLLMService:
@@ -720,6 +819,8 @@ def _build_google_llm(system_instruction: str) -> GoogleVertexLLMService:
             model=os.getenv("GOOGLE_MODEL", "gemini-2.5-flash"),
             system_instruction=system_instruction,
             max_tokens=_MAX_TOKENS,
+            thinking=GoogleVertexLLMService.ThinkingConfig(thinking_budget=0),
+            extra={"stop_sequences": ["<start_of_turn>"]},
         ),
     )
 
@@ -767,7 +868,7 @@ def _build_vad() -> SileroVADAnalyzer:
 
 def _build_aggregators(vad: Optional[SileroVADAnalyzer], context: LLMContext, is_sarvam: bool = True):
     if vad is None:
-        timeout = 0.0 if is_sarvam else 0.25
+        timeout = 0.0 if is_sarvam else 0.05
         stop_strategy = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=timeout)
     else:
         stop_strategy = TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())
@@ -843,6 +944,10 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
 
     transport = _build_transport(websocket)
     use_local_vad = _get_bool_env("USE_LOCAL_VAD", True)
+    logger.info(
+        f"[barge-in] USE_LOCAL_VAD={use_local_vad} — "
+        f"{'VAD-driven interruption ENABLED' if use_local_vad else 'NO local VAD; barge-in relies on STT UserStartedSpeakingFrame only'}"
+    )
     vad = _build_vad() if use_local_vad else None
     stt = _build_sarvam_stt(pc_lang)
     llm = _build_google_llm(config.system_instruction)
@@ -852,6 +957,7 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
         config.voice, pc_lang, config.speaking_rate
     )
     text_normalizer = TextNormalizerProcessor(pc_lang)
+    llm_sanitizer = LLMOutputSanitizer()
 
     tools = _build_tools_schema(config.extra_tools)
     llm.register_function("terminate_call", terminate_call)
@@ -923,6 +1029,7 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
         user_aggregator,
         tracer_agg,
         llm,
+        llm_sanitizer,
         text_normalizer,
         tts_service,
         tracer_tts,
