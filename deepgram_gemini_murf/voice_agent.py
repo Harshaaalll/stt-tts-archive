@@ -17,6 +17,11 @@ from urllib.parse import unquote
 import aiohttp
 from fastapi import WebSocket
 from loguru import logger
+import logging
+logger.remove()
+logger.add(sys.stderr, level="INFO")
+logging.getLogger("pipecat").setLevel(logging.WARNING)
+logging.getLogger("google").setLevel(logging.WARNING)
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -61,6 +66,7 @@ from pipecat.transports.websocket.fastapi import (
 )
 from pipecat.turns.user_mute import FirstSpeechUserMuteStrategy
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 # Parent-project imports (sys.path set up by the entrypoint script).
@@ -325,6 +331,13 @@ def _require_env(name: str) -> str:
     if not val:
         raise ValueError(f"{name} env var is required")
     return val
+
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.lower() in ("true", "1", "yes", "on")
 
 
 def _build_deepgram_stt(language: Language) -> DeepgramSTTService:
@@ -723,16 +736,20 @@ def _build_vad() -> SileroVADAnalyzer:
     )
 
 
-def _build_aggregators(vad: SileroVADAnalyzer, context: LLMContext):
+def _build_aggregators(vad: Optional[SileroVADAnalyzer], context: LLMContext, is_sarvam: bool = False):
+    if vad is None:
+        timeout = 0.0 if is_sarvam else 0.25
+        stop_strategy = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=timeout)
+    else:
+        stop_strategy = TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())
+
     return LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=vad,
             user_idle_timeout=8.0,
             user_turn_strategies=UserTurnStrategies(
-                stop=[TurnAnalyzerUserTurnStopStrategy(
-                    turn_analyzer=LocalSmartTurnAnalyzerV3(),
-                )],
+                stop=[stop_strategy],
             ),
             user_mute_strategies=[FirstSpeechUserMuteStrategy()],
         ),
@@ -796,7 +813,8 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
         await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
 
     transport = _build_transport(websocket)
-    vad = _build_vad()
+    use_local_vad = _get_bool_env("USE_LOCAL_VAD", True)
+    vad = _build_vad() if use_local_vad else None
     stt = _build_deepgram_stt(pc_lang)
     llm = _build_google_llm(config.system_instruction)
     tts_service = _build_murf_tts(
@@ -875,7 +893,6 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
         if config.greeting_text:
             logger.info(f"Playing one-time greeting: {config.greeting_text!r}")
             await task.queue_frame(TTSSpeakFrame(config.greeting_text))
-            await asyncio.sleep(0.6 + 0.08 * len(config.greeting_text))
         await task.queue_frame(LLMRunFrame())
 
     @transport.event_handler("on_client_disconnected")
