@@ -71,6 +71,7 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 # Parent-project imports (sys.path set up by the entrypoint script).
 
 from text_normalizer import normalize_text
+from filler_classifier import SIMPLE_FILLERS as _DEFAULT_FILLER_PHRASES
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +280,18 @@ class CallMetricsAccumulator(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class FillerInjector(FrameProcessor):
+    """Injects a TTSSpeakFrame downstream on demand. Placed AFTER the LLM so
+    external `inject()` calls beat the LLM's own output to TTS."""
+
+    async def inject(self, text: str):
+        await self.push_frame(TTSSpeakFrame(text=text), FrameDirection.DOWNSTREAM)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        await self.push_frame(frame, direction)
+
+
 class LLMOutputSanitizer(FrameProcessor):
     """Strip `<speech>`/`</speech>` tags and drop `<start_of_turn>...` blocks
     from the streaming LLM text before it reaches TTS. Buffers a small tail
@@ -451,7 +464,7 @@ def _require_env(name: str) -> str:
     return val
 
 
-_DEFAULT_FILLER_PHRASES = ["ठीक है।", "एक सेकंड।", "हम्म।", "अच्छा।"]
+_DEFAULT_FILLER_PAUSE_SUFFIX = "..."
 
 
 def _get_filler_config():
@@ -469,7 +482,12 @@ def _get_filler_config():
                 phrases = parsed
         except json.JSONDecodeError:
             pass
-    return enabled, min_chars, phrases
+    suffix = os.getenv("FILLER_PAUSE_SUFFIX", _DEFAULT_FILLER_PAUSE_SUFFIX)
+    phrases = [
+        p if p.rstrip().endswith(suffix) else f"{p.rstrip()}{suffix}"
+        for p in phrases
+    ]
+    return enabled, min_chars, phrases, suffix
 
 
 def _get_bool_env(name: str, default: bool) -> bool:
@@ -961,6 +979,7 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
     )
     text_normalizer = TextNormalizerProcessor(pc_lang)
     llm_sanitizer = LLMOutputSanitizer()
+    filler_injector = FillerInjector()
 
     tools = _build_tools_schema(config.extra_tools)
     llm.register_function("terminate_call", terminate_call)
@@ -975,11 +994,11 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
     context = LLMContext(messages=initial_messages, tools=tools)
     user_aggregator, assistant_aggregator = _build_aggregators(vad, context)
 
-    filler_enabled, filler_min_chars, filler_phrases = _get_filler_config()
-    filler_state = {"last_index": -1}
+    filler_enabled, filler_min_chars, filler_phrases, filler_suffix = _get_filler_config()
+    filler_state = {"last_index": -1, "injected_phrases": set()}
     logger.info(
         f"[filler] enabled={filler_enabled} min_chars={filler_min_chars} "
-        f"phrases={filler_phrases}"
+        f"suffix={filler_suffix!r} phrases={filler_phrases}"
     )
 
     @user_aggregator.event_handler("on_user_turn_stopped")
@@ -992,12 +1011,55 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
                 idx = (filler_state["last_index"] + 1) % len(filler_phrases)
                 filler_state["last_index"] = idx
                 phrase = filler_phrases[idx]
-                logger.info(f"[filler] queueing {phrase!r} (user_text_len={len(text)})")
-                await aggregator.push_frame(TTSSpeakFrame(text=phrase))
+                filler_state["injected_phrases"].add(phrase)
+                logger.info(f"[filler] injecting {phrase!r} (user_text_len={len(text)})")
+                await filler_injector.inject(phrase)
+
+    def _strip_filler_prefix(content: str) -> str:
+        if not content:
+            return content
+        stripped = content.lstrip()
+        candidates = set(filler_state["injected_phrases"])
+        for p in filler_phrases:
+            candidates.add(p)
+            candidates.add(p.rstrip(" ."))
+            candidates.add(p.rstrip(" ." + filler_suffix))
+        for p in list(candidates):
+            candidates.add(p.replace("...", ".. ."))
+        for cand in sorted(candidates, key=len, reverse=True):
+            if cand and stripped.startswith(cand):
+                stripped = stripped[len(cand):].lstrip(" .।")
+                break
+        return stripped
 
     @assistant_aggregator.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message):
-        logger.info(f"[Context Assistant] Aggregated assistant turn text: {message.content!r}")
+        original = message.content or ""
+        cleaned = _strip_filler_prefix(original)
+        if cleaned != original:
+            logger.info(f"[filler-strip] {original[:60]!r} -> {cleaned[:60]!r}")
+            try:
+                message.content = cleaned
+            except Exception:
+                pass
+            try:
+                ctx = getattr(aggregator, "_context", None) or getattr(aggregator, "context", None)
+                if ctx is not None and getattr(ctx, "messages", None):
+                    last = ctx.messages[-1]
+                    if isinstance(last, dict):
+                        c = last.get("content")
+                        if isinstance(c, str) and c.startswith(original[: min(len(original), 40)]):
+                            last["content"] = cleaned
+                    else:
+                        c = getattr(last, "content", None)
+                        if isinstance(c, str) and c.startswith(original[: min(len(original), 40)]):
+                            try:
+                                last.content = cleaned
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.warning(f"[filler-strip] could not mutate context: {e}")
+        logger.info(f"[Context Assistant] Aggregated assistant turn text: {(message.content or '')!r}")
 
     metrics_accumulator = CallMetricsAccumulator()
     transcript_logger = TranscriptLogger()
@@ -1033,7 +1095,8 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
         tracer_agg,
         llm,
         llm_sanitizer,
-        text_normalizer,
+        # text_normalizer,  # TEMP: disabled for filler tuning
+        filler_injector,
         tts_service,
         tracer_tts,
     ]
