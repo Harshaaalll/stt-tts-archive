@@ -1,5 +1,5 @@
 """
-Deepgram STT + Groq LLM + Murf AI TTS.
+Deepgram STT + Vertex Gemini LLM (with explicit cache) + Murf AI TTS.
 """
 
 import asyncio
@@ -21,6 +21,7 @@ import logging
 logger.remove()
 logger.add(sys.stderr, level="INFO")
 logging.getLogger("pipecat").setLevel(logging.WARNING)
+logging.getLogger("google").setLevel(logging.WARNING)
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -54,8 +55,9 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.serializers.exotel import ExotelFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat_murf_tts import MurfTTSService
-from pipecat.services.groq.llm import GroqLLMService
+from pipecat.services.google.vertex.llm import GoogleVertexLLMService
 
+from google.genai.types import CreateCachedContentConfig
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import (
@@ -68,6 +70,7 @@ from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import Speec
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 # Parent-project imports (sys.path set up by the entrypoint script).
+
 from text_normalizer import normalize_text
 from filler_classifier import SIMPLE_FILLERS as _DEFAULT_FILLER_PHRASES
 
@@ -130,7 +133,7 @@ _MURF_VOICES = {
 
 
 # ---------------------------------------------------------------------------
-# Pricing — Deepgram STT (USD) + Groq LLM (USD) + Murf AI TTS (USD)
+# Pricing — Deepgram STT (USD) + Vertex Gemini LLM (USD) + Murf AI TTS (USD)
 # ---------------------------------------------------------------------------
 
 PRICING = {
@@ -148,16 +151,14 @@ PRICING = {
         "GEN2":     30.0 / 1_000_000.0,  # $30 / 1M characters
         "_default": 10.0 / 1_000_000.0,
     },
-    # Groq — native USD per 1M tokens (no cache pricing tier).
-    # Verify at https://groq.com/pricing before relying on these numbers.
+    # Vertex Gemini — native USD per 1M tokens.
     "llm_usd": {
-        "llama-3.3-70b-versatile":                       {"input": 0.59,  "cache_read": 0.59,  "output": 0.79},
-        "llama-3.1-8b-instant":                          {"input": 0.05,  "cache_read": 0.05,  "output": 0.08},
-        "meta-llama/llama-4-scout-17b-16e-instruct":     {"input": 0.11,  "cache_read": 0.11,  "output": 0.34},
-        "meta-llama/llama-4-maverick-17b-128e-instruct": {"input": 0.20,  "cache_read": 0.20,  "output": 0.60},
-        "openai/gpt-oss-120b":                           {"input": 0.15,  "cache_read": 0.15,  "output": 0.75},
-        "openai/gpt-oss-20b":                            {"input": 0.10,  "cache_read": 0.10,  "output": 0.50},
-        "_default":                                      {"input": 0.59,  "cache_read": 0.59,  "output": 0.79},
+        "gemini-2.5-flash":        {"input": 0.30,  "cache_read": 0.03,  "output": 2.50},
+        "gemini-2.5-flash-lite":   {"input": 0.10,  "cache_read": 0.01,  "output": 0.40},
+        "gemini-2.5-pro":          {"input": 1.25,  "cache_read": 0.13,  "output": 10.00},
+        "gemini-3.1-flash-lite":   {"input": 0.25,  "cache_read": 0.025, "output": 1.50},
+        "gemini-3.1-pro-preview":  {"input": 2.00,  "cache_read": 0.20,  "output": 12.00},
+        "_default":                {"input": 0.30,  "cache_read": 0.03,  "output": 2.50},
     },
 }
 
@@ -211,7 +212,7 @@ def _compute_call_costs(
     tts_usd = tts_characters * tts_rate
     tts_inr = tts_usd * inr_per_usd
 
-    # Groq LLM — native USD per 1M tokens.
+    # Gemini LLM — native USD per 1M tokens.
     llm_rates = PRICING["llm_usd"].get(llm_model, PRICING["llm_usd"]["_default"])
     uncached_input = max(0, llm_prompt_tokens - llm_cache_read_tokens)
     llm_usd = (
@@ -253,6 +254,7 @@ class AgentConfig:
     max_call_duration_secs: int = 240
     terminate_min_elapsed_secs: float = 20.0
     greeting_text: Optional[str] = None
+    
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +415,11 @@ class LatencyTimeline:
 
 
 class LatencyTracer(FrameProcessor):
-    """Observes frames flowing past a pipeline position and marks stage timestamps."""
+    """Observes frames flowing past a pipeline position and marks stage timestamps.
+
+    Placed at multiple points; dedup via LatencyTimeline.marked ensures each
+    stage is only logged once per turn.
+    """
 
     def __init__(self, timeline: LatencyTimeline, **kwargs):
         super().__init__(**kwargs)
@@ -729,19 +735,167 @@ def _build_murf_tts(
     return tts
 
 
-def _build_groq_llm(system_instruction: str) -> GroqLLMService:
-    """Groq's OpenAI-compatible streaming LLM. No prompt caching (Groq
-    doesn't support it), so the full system prompt is sent every turn."""
-    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-    logger.info(
-        f"[groq] model={model} sys_prompt_chars={len(system_instruction or '')}"
+class CachingGoogleVertexLLMService(GoogleVertexLLMService):
+    """Vertex Gemini with explicit `CachedContent` for the system prompt."""
+
+    def __init__(
+        self,
+        *,
+        cache_ttl_seconds: int = 3600,
+        cache_display_name: str = "sarvam_agent_system_prompt",
+        cache_enabled: bool = True,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._cache_ttl_seconds = cache_ttl_seconds
+        self._cache_display_name = cache_display_name
+        self._cache_enabled = cache_enabled
+        self._cached_content_name: str | None = None
+        self._cache_setup_lock = asyncio.Lock()
+        self._cache_create_attempted = False
+        self._original_system_instruction = self._settings.system_instruction
+
+    async def _ensure_cache(self) -> None:
+        if not self._cache_enabled or self._cached_content_name is not None:
+            return
+        if self._cache_create_attempted:
+            return
+        async with self._cache_setup_lock:
+            if self._cached_content_name is not None or self._cache_create_attempted:
+                return
+            self._cache_create_attempted = True
+            sys_prompt_len = len(self._original_system_instruction or "")
+            tools = getattr(self, "_tools", None) or None
+            tool_config = getattr(self, "_tool_config", None) or None
+
+            logger.info(
+                f"[explicit-cache] attempting create: model={self._settings.model} "
+                f"sys_prompt_chars={sys_prompt_len} "
+                f"tools={len(tools) if tools else 0} "
+                f"ttl={self._cache_ttl_seconds}s"
+            )
+            try:
+                config_kwargs = dict(
+                    system_instruction=self._original_system_instruction,
+                    ttl=f"{self._cache_ttl_seconds}s",
+                    display_name=self._cache_display_name,
+                )
+                if tools:
+                    config_kwargs["tools"] = tools
+                if tool_config:
+                    config_kwargs["tool_config"] = tool_config
+                cached = await self._client.aio.caches.create(
+                    model=self._settings.model,
+                    config=CreateCachedContentConfig(**config_kwargs),
+                )
+                self._cached_content_name = cached.name
+                logger.info(
+                    f"[explicit-cache] CREATED ✓ name={cached.name} "
+                    f"ttl={self._cache_ttl_seconds}s model={self._settings.model}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"[explicit-cache] CREATE FAILED ✗ {type(e).__name__}: {e} "
+                    f"— falling back to implicit caching"
+                )
+                import traceback
+                logger.error(f"[explicit-cache] traceback:\n{traceback.format_exc()}")
+
+    async def _stream_content(self, context):
+        await self._ensure_cache()
+        response = await super()._stream_content(context)
+        return self._wrap_response_max_metrics(response)
+
+    async def _wrap_response_max_metrics(self, response):
+        max_cache = 0
+        max_prompt = 0
+        max_completion = 0
+        max_total = 0
+        async for chunk in response:
+            meta = getattr(chunk, "usage_metadata", None)
+            if meta is not None:
+                curr_cache = getattr(meta, "cached_content_token_count", None) or 0
+                curr_prompt = getattr(meta, "prompt_token_count", None) or 0
+                curr_completion = getattr(meta, "candidates_token_count", None) or 0
+                curr_total = getattr(meta, "total_token_count", None) or 0
+                if curr_cache > max_cache:
+                    max_cache = curr_cache
+                if curr_prompt > max_prompt:
+                    max_prompt = curr_prompt
+                if curr_completion > max_completion:
+                    max_completion = curr_completion
+                if curr_total > max_total:
+                    max_total = curr_total
+                try:
+                    meta.cached_content_token_count = max_cache
+                    meta.prompt_token_count = max_prompt
+                    meta.candidates_token_count = max_completion
+                    meta.total_token_count = max_total
+                except (AttributeError, TypeError):
+                    pass
+            yield chunk
+
+    _gen_params_logged = False
+
+    def _build_generation_params(
+        self,
+        system_instruction=None,
+        tools=None,
+        tool_config=None,
+    ):
+        if self._cached_content_name:
+            params = super()._build_generation_params(
+                system_instruction=None,
+                tools=None,
+                tool_config=None,
+            )
+            params["cached_content"] = self._cached_content_name
+        else:
+            params = super()._build_generation_params(
+                system_instruction=system_instruction,
+                tools=tools,
+                tool_config=tool_config,
+            )
+        # Backstop: if pipecat's parent didn't propagate thinking / stop_sequences,
+        # inject them from settings here so cached-content path can't lose them.
+        thinking = self._settings.thinking
+        if thinking is not None and hasattr(thinking, "model_dump") and "thinking_config" not in params:
+            try:
+                params["thinking_config"] = thinking.model_dump(exclude_unset=True)
+            except Exception:
+                pass
+        extra = getattr(self._settings, "extra", None) or {}
+        if "stop_sequences" in extra and "stop_sequences" not in params:
+            params["stop_sequences"] = extra["stop_sequences"]
+        if not CachingGoogleVertexLLMService._gen_params_logged:
+            CachingGoogleVertexLLMService._gen_params_logged = True
+            logged = {
+                k: (v if k in ("thinking_config", "stop_sequences", "max_output_tokens",
+                               "temperature", "top_p", "top_k", "cached_content")
+                    else f"<{type(v).__name__}>")
+                for k, v in params.items()
+            }
+            logger.info(f"[vertex-gen-params] {logged}")
+        return params
+
+
+def _build_google_llm(system_instruction: str) -> GoogleVertexLLMService:
+    cache_enabled = os.getenv("GOOGLE_EXPLICIT_CACHE", "true").lower() in (
+        "true", "1", "yes", "on"
     )
-    return GroqLLMService(
-        api_key=_require_env("GROQ_API_KEY"),
-        settings=GroqLLMService.Settings(
-            model=model,
+    cache_ttl = int(os.getenv("GOOGLE_CACHE_TTL_SECONDS", "3600"))
+    return CachingGoogleVertexLLMService(
+        credentials_path=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+        project_id=_require_env("GCP_PROJECT_ID"),
+        location=os.getenv("GCP_LOCATION", "asia-southeast1"),
+        cache_enabled=cache_enabled,
+        cache_ttl_seconds=cache_ttl,
+        settings=GoogleVertexLLMService.Settings(
+            model=os.getenv("GOOGLE_MODEL", "gemini-2.5-flash"),
             system_instruction=system_instruction,
             max_tokens=_MAX_TOKENS,
+            thinking=GoogleVertexLLMService.ThinkingConfig(thinking_budget=0),
+            extra={"stop_sequences": ["<start_of_turn>"]},
         ),
     )
 
@@ -823,11 +977,15 @@ def _build_tools_schema(extra_tools: Optional[ToolsSchema]) -> ToolsSchema:
 # ---------------------------------------------------------------------------
 
 async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
+    explicit_cache_on = os.getenv("GOOGLE_EXPLICIT_CACHE", "true").lower() in (
+        "true", "1", "yes", "on"
+    )
     logger.info(
-        f"Starting {config.name} call [DEEPGRAM+GROQ+MURF] | "
+        f"Starting {config.name} call [DEEPGRAM+GEMINI+MURF] | "
         f"lang={config.language} "
         f"stt={os.getenv('DEEPGRAM_MODEL', 'nova-3')} "
-        f"llm={os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')} "
+        f"llm={os.getenv('GOOGLE_MODEL', 'gemini-2.5-flash')} "
+        f"explicit_cache={'on' if explicit_cache_on else 'off'} "
         f"tts_model={os.getenv('MURF_MODEL', 'FALCON')} "
         f"tts_voice={_resolve_murf_voice(config.voice)} "
         f"tts_rate={_resolve_murf_rate(config.speaking_rate)} "
@@ -867,7 +1025,9 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
     )
     vad = _build_vad() if use_local_vad else None
     stt = _build_deepgram_stt(pc_lang)
-    llm = _build_groq_llm(config.system_instruction)
+    llm = _build_google_llm(config.system_instruction)
+    if hasattr(llm, "_ensure_cache"):
+        asyncio.create_task(llm._ensure_cache())
     tts_service = _build_murf_tts(
         config.voice, pc_lang, config.speaking_rate
     )
@@ -899,20 +1059,19 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
     async def on_user_turn_stopped(aggregator, strategy, message):
         timeline.mark("smart_turn_aggregation_complete")
         logger.info(f"[Context User] Aggregated user turn text: {message.content!r}")
-        # COMMENTED OUT: Fillers disabled for now
-        # if filler_enabled and filler_phrases:
-        #     text = (message.content or "").strip()
-        #     if len(text) >= filler_min_chars:
-        #         idx = (filler_state["last_index"] + 1) % len(filler_phrases)
-        #         filler_state["last_index"] = idx
-        #         phrase = filler_phrases[idx]
-        #         filler_state["injected_phrases"].add(phrase)
-        #         logger.info(f"[filler] injecting {phrase!r} (user_text_len={len(text)})")
-        #         await filler_injector.inject(phrase)
+        if filler_enabled and filler_phrases:
+            text = (message.content or "").strip()
+            if len(text) >= filler_min_chars:
+                idx = (filler_state["last_index"] + 1) % len(filler_phrases)
+                filler_state["last_index"] = idx
+                phrase = filler_phrases[idx]
+                filler_state["injected_phrases"].add(phrase)
+                logger.info(f"[filler] injecting {phrase!r} (user_text_len={len(text)})")
+                await filler_injector.inject(phrase)
 
     def _strip_filler_prefix(content: str) -> str:
         """Remove any known filler phrase from the start of `content` so the
-        assistant turn stored in LLM context doesn't teach Groq to mimic the
+        assistant turn stored in LLM context doesn't teach Gemini to mimic the
         filler pattern in later replies."""
         if not content:
             return content
@@ -943,7 +1102,7 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
                 message.content = cleaned
             except Exception:
                 pass
-            # Also mutate the stored LLM context so Groq's next request
+            # Also mutate the stored LLM context so Gemini's next request
             # doesn't see the filler in its history.
             try:
                 ctx = getattr(aggregator, "_context", None) or getattr(aggregator, "context", None)
@@ -970,6 +1129,7 @@ async def run_voice_agent(websocket: WebSocket, config: AgentConfig) -> None:
     tracer_stt = LatencyTracer(timeline)
     tracer_agg = LatencyTracer(timeline)
     tracer_tts = LatencyTracer(timeline)
+
 
     idle_retry_count = {"n": 0}
 
@@ -1060,7 +1220,7 @@ async def export_call_token_usage(
     agent_name: str = "default_agent",
     call_duration_s: float = 0.0,
 ) -> None:
-    """Append one row to token_logs/<date>/token_logs_<agent>_deepgram_groq_murf.csv."""
+    """Append one row to token_logs/<date>/token_logs_<agent>_deepgram_gemini_murf.csv."""
     try:
         path = getattr(websocket.url, "path", "") or ""
         custom_field = unquote(path.split("/")[-1]) if path else "Unknown"
@@ -1069,7 +1229,7 @@ async def export_call_token_usage(
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M:%S")
 
-        llm_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        llm_model = os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
         stt_model = os.getenv("DEEPGRAM_MODEL", "nova-3")
 
         costs = _compute_call_costs(
@@ -1087,7 +1247,7 @@ async def export_call_token_usage(
         )
         log_dir = os.path.join(project_root, "token_logs", date_str)
         os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"token_logs_{agent_name}_deepgram_groq_murf.csv")
+        log_file = os.path.join(log_dir, f"token_logs_{agent_name}_deepgram_gemini_murf.csv")
         file_exists = os.path.exists(log_file)
 
         if call_duration_s > 0:

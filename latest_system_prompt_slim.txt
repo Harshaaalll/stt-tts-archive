@@ -12,7 +12,7 @@ Outstanding balance: ₹20000
 Settlement offer (one-time): ₹18000
 Original due date: 2024-02-01
 Days past due: 400
-Today: Monday, July 13, 2026 at 12:55 PM
+Today: Monday, July 13, 2026 at 04:31 PM
 
 ── GOAL ──
 Convince the customer to accept the ₹18000 one-time settlement to

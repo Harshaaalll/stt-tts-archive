@@ -1,10 +1,10 @@
 """
-Deepgram+Groq+Murf FastAPI server — drop-in alternative to remote_server.py /
+Deepgram+Gemini+Murf FastAPI server — drop-in alternative to remote_server.py /
 sarvam_agent/server.py. Same /fusion-mfi-ws/{CustomField} endpoint shape so
 Exotel does not need URL changes; runs on port 7860 by default.
 
-  cd /media/kabir/ssd/dev_main/stt-tts
-  python deepgram_groq_murf/server.py
+  cd /media/kabir/ssd/local-stt-tts-rnd/llm-tts
+  python deepgram_gemini_murf/server.py
 
 Run EITHER this server OR another — they all share port 7860.
 """
@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote
 
 # Make the parent project root importable (fusion_prompt_panch, history_retriever,
 # backchannel all live there). Use sys.path.append (not insert) so local
-# modules inside deepgram_groq_murf/ still resolve first.
+# modules inside deepgram_gemini_murf/ still resolve first.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_HERE)
 if _PROJECT_ROOT not in sys.path:
@@ -34,8 +34,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from agent import run_agent_live_fintech_exotel
-from fusion_prompt_panch import get_dynamic_greeting
-from fusion_prompt_slim import get_fusion_negotiation_prompt
+from fusion_prompt_panch import get_dynamic_greeting, get_fusion_negotiation_prompt
 
 _ENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
 load_dotenv(dotenv_path=_ENV_PATH, override=True)
@@ -65,7 +64,7 @@ async def websocket_endpoint(
         CustomField: str = None,
 ):
     await websocket.accept()
-    print("[DEEPGRAM+GROQ+MURF] WebSocket connection accepted")
+    print("[DEEPGRAM+GEMINI+MURF] WebSocket connection accepted")
     try:
         print(websocket.query_params)
         system_instruction, dynamic_instruction, _ = await get_fusion_negotiation_prompt(CustomField)
@@ -82,12 +81,12 @@ async def websocket_endpoint(
             dynamic_instruction=dynamic_instruction,
         )
     except Exception as e:
-        print(f"[DEEPGRAM+GROQ+MURF] Exception in run_bot: {e}")
+        print(f"[DEEPGRAM+GEMINI+SARVAM] Exception in run_bot: {e}")
 
 
 @app.get("/fusion-mfi")
 async def fusion_mfi_connect(request: Request) -> Dict[Any, Any]:
-    print("[DEEPGRAM+GROQ+MURF] printing connect method args")
+    print("[DEEPGRAM+GEMINI+MURF] printing connect method args")
     print(request.url.query)
     query_params = request.url.query
     params = parse_qs(query_params)
@@ -111,13 +110,13 @@ async def fusion_mfi_connect(request: Request) -> Dict[Any, Any]:
     else:
         ws_url = f"{protocol}://apocynaceous-nonsuccessionally-yajaira.ngrok-free.dev/fusion-mfi-ws/{custom_data}"
 
-    print(f"[DEEPGRAM+GROQ+MURF] Generated WS URL for client: {ws_url}")
+    print(f"[DEEPGRAM+GEMINI+MURF] Generated WS URL for client: {ws_url}")
     return {"url": ws_url}
 
 
 @app.get("/")
 async def root_bot_connect(request: Request):
-    print("[DEEPGRAM+GROQ+MURF] Handled root route request")
+    print("[DEEPGRAM+GEMINI+MURF] Handled root route request")
     return await fusion_mfi_connect(request)
 
 
@@ -136,7 +135,7 @@ if os.path.exists(_CLIENT_DIST):
 
 async def main():
     port = int(os.environ.get("PORT", 7860))
-    print(f"[DEEPGRAM+GROQ+MURF] Starting on port {port}")
+    print(f"[DEEPGRAM+GEMINI+MURF] Starting on port {port}")
     config = uvicorn.Config(app, host="0.0.0.0", port=port)
     server = uvicorn.Server(config)
     await server.serve()

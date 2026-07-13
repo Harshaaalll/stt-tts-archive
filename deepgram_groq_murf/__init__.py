@@ -1,3 +1,3 @@
 """
-Deepgram STT + Vertex Gemini LLM (with explicit cache) + Murf AI TTS.
+Deepgram STT + Groq LLM + Murf AI TTS.
 """

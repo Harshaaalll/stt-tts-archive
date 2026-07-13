@@ -1,5 +1,5 @@
 """
-Fusion Finance settlement-collection agent — Deepgram STT + Groq LLM + Murf AI TTS.
+Fusion Finance settlement-collection agent — Deepgram STT + Gemini LLM + Murf AI TTS.
 """
 
 from typing import Optional
@@ -29,7 +29,7 @@ async def run_agent_live_fintech_exotel(
     greeting_text: Optional[str] = None,
     speaking_rate: float = 1.0,
 ) -> None:
-    """Entry point for the Deepgram+Groq+Murf server (Fusion Finance calls)."""
+    """Entry point for the Deepgram+Gemini+Murf server (Fusion Finance calls)."""
     config = AgentConfig(
         name="fusion_mfi",
         system_instruction=system_instruction or "",
