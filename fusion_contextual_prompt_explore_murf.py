@@ -542,10 +542,10 @@ async def get_fusion_explore_prompt(user_data=None):
         </current_date_time>
     """
 
-    # try:
-    #     with open("latest_system_prompt_explore.txt", "w", encoding="utf-8") as f:
-    #         f.write(SYSTEM_PROMPT)
-    # except Exception as e:
-    #     logger.error(f"Failed to save explore system prompt to file: {e}")
+    try:
+        with open("latest_system_prompt_explore.txt", "w", encoding="utf-8") as f:
+            f.write(SYSTEM_PROMPT)
+    except Exception as e:
+        logger.error(f"Failed to save explore system prompt to file: {e}")
 
     return SYSTEM_PROMPT, DYNAMIC_PROMPT
