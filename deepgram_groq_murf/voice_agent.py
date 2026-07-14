@@ -526,10 +526,28 @@ def _build_deepgram_stt(language: Language) -> DeepgramSTTService:
         dg_language = dg_language_env
         logger.info(f"[deepgram] using DEEPGRAM_LANGUAGE={dg_language!r} (env override)")
     else:
-        dg_language = "multi"
+        # Determine language code based on model capabilities and prompt-defined list
+        if language and language.value:
+            base_lang = language.value.split("-")[0]
+            # Mapped allowed languages from prompt configurations
+            allowed_langs = {"hi", "en", "mr", "gu", "kn", "te", "ta", "bn", "pa"}
+            
+            if "nova-3" in stt_model:
+                if base_lang == "en":
+                    dg_language = "en"
+                else:
+                    dg_language = "multi"
+            else:
+                # If model is nova-2 (or other), accept the specific language code if allowed
+                if base_lang in allowed_langs:
+                    dg_language = base_lang
+                else:
+                    dg_language = "en"
+        else:
+            dg_language = "en"
         logger.info(
-            f"[deepgram] no DEEPGRAM_LANGUAGE set; defaulting to 'multi' "
-            f"(call language was {language.value!r}; nova-3 requires 'multi' for non-English)"
+            f"[deepgram] no DEEPGRAM_LANGUAGE set; locking to {dg_language!r} "
+            f"(model={stt_model!r}, derived from call language {language.value!r})"
         )
     svc = DeepgramSTTService(
         api_key=_require_env("DEEPGRAM_API_KEY"),
@@ -538,7 +556,7 @@ def _build_deepgram_stt(language: Language) -> DeepgramSTTService:
             language=dg_language,
             punctuate=True,
             interim_results=True,
-            utterance_end_ms=utterance_end,
+            endpointing=utterance_end,
         ),
     )
     _PARAMS_TO_STRIP = (
@@ -547,7 +565,6 @@ def _build_deepgram_stt(language: Language) -> DeepgramSTTService:
         "smart_format",
         "detect_entities",
         "dictation",
-        "utterance_end_ms",
     )
     _orig_build = svc._build_connect_kwargs
 
@@ -792,7 +809,8 @@ def _build_aggregators(vad: Optional[SileroVADAnalyzer], context: LLMContext, is
         timeout = 0.0 if is_sarvam else 0.05
         stop_strategy = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=timeout)
     else:
-        stop_strategy = TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())
+        # Fast VAD-driven turn detection (no smart-turn model CPU overhead or delays)
+        stop_strategy = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.25)
 
     return LLMContextAggregatorPair(
         context,

@@ -1,19 +1,19 @@
-"""Minimal Sarvam STT + Sarvam LLM + Murf TTS pipeline.
+"""Minimal Sarvam STT + Gemini LLM + Sarvam TTS pipeline.
 
-No fillers, no sanitizer, no text normalizer, no tool calls, no latency
-tracer. Everything the "full" agents have is stripped out so we can
-measure the raw provider-side latency floor.
-
-Uses the same env vars as the other agents (no new names) so the shared
-.env just works:
-    SARVAM_API_KEY   required
-    MURF_API_KEY     required
-    SARVAM_STT_MODEL default: saarika:v2.5
-    SARVAM_MODEL     default: sarvam-m
-    MURF_VOICE_ID    plain string OR JSON dict
-                     ({"voice_id":"Abhinav","style":"Conversational","model":"GEN2","rate":50,...})
-    MURF_MODEL / MURF_STYLE / MURF_RATE / MURF_PITCH / MURF_VARIATION
-                     optional overrides
+Env vars:
+    SARVAM_API_KEY            required (used for both STT and TTS)
+    GCP_PROJECT_ID            required
+    GOOGLE_APPLICATION_CREDENTIALS  path to Vertex service-account json
+    GOOGLE_MODEL              default: gemini-2.5-flash
+    GCP_LOCATION              default: asia-southeast1
+    SARVAM_STT_MODEL          default: saarika:v2.5
+    SARVAM_TTS_MODEL          default: bulbul:v2   (or bulbul:v3-beta)
+    SARVAM_TTS_VOICE          default: anushka (v2) / aditya (v3)
+    SARVAM_TTS_PACE           optional float (v2: 0.3-3.0, v3: 0.5-2.0)
+    SARVAM_TTS_PITCH          optional float (v2 only, -0.75..0.75)
+    SARVAM_TTS_LOUDNESS       optional float (v2 only, 0.3..3.0)
+    SARVAM_TTS_TEMPERATURE    optional float (v3 only, 0.01..1.0)
+    SARVAM_TTS_INR_PER_CHAR   optional override for TTS INR/char cost
 """
 
 import asyncio
@@ -52,9 +52,9 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.serializers.exotel import ExotelFrameSerializer
 from pipecat.services.sarvam.stt import SarvamSTTService
+from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.services.google.vertex.llm import GoogleVertexLLMService
 from google.genai.types import CreateCachedContentConfig
-from pipecat_murf_tts import MurfTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
@@ -345,17 +345,19 @@ class CachingGoogleVertexLLMService(GoogleVertexLLMService):
 
 
 # ---------------------------------------------------------------------------
-# Pricing — Sarvam STT (INR-native) + Vertex Gemini LLM (USD) + Murf AI TTS (USD)
+# Pricing — Sarvam STT (INR-native) + Vertex Gemini LLM (USD) + Sarvam TTS (INR)
 # ---------------------------------------------------------------------------
 
 PRICING = {
-    # Sarvam — native INR.
+    # Sarvam STT — native INR (₹30/hr).
     "stt_sarvam_per_sec_inr":  30.0 / 3600.0,
-    # Murf TTS — native USD per character
-    "tts_murf_per_char_usd": {
-        "FALCON":   10.0 / 1_000_000.0,  # $10 / 1M characters
-        "GEN2":     30.0 / 1_000_000.0,  # $30 / 1M characters
-        "_default": 10.0 / 1_000_000.0,
+    # Sarvam TTS — native INR per character. Override via SARVAM_TTS_INR_PER_CHAR.
+    # Sarvam public list price (2026): ₹30 / 10,000 chars for Bulbul v3 realtime & streaming.
+    "tts_sarvam_per_char_inr": {
+        "bulbul:v2":       30.0 / 10_000.0,
+        "bulbul:v3-beta":  30.0 / 10_000.0,
+        "bulbul:v3":       30.0 / 10_000.0,
+        "_default":        30.0 / 10_000.0,
     },
     # Vertex Gemini — native USD per 1M tokens.
     "llm_usd": {
@@ -394,19 +396,19 @@ def _compute_call_costs(
     stt_inr = call_duration_s * PRICING["stt_sarvam_per_sec_inr"]
     stt_usd = stt_inr / inr_per_usd
 
-    # TTS — Murf AI (native USD).
-    tts_model = os.getenv("MURF_MODEL", "FALCON").upper()
-    tts_rate = PRICING["tts_murf_per_char_usd"].get(
-        tts_model, PRICING["tts_murf_per_char_usd"]["_default"]
+    # TTS — Sarvam Bulbul (native INR per character).
+    tts_model = os.getenv("SARVAM_TTS_MODEL", "bulbul:v2").lower()
+    tts_rate_inr = PRICING["tts_sarvam_per_char_inr"].get(
+        tts_model, PRICING["tts_sarvam_per_char_inr"]["_default"]
     )
-    tts_per_char_override = os.getenv("MURF_TTS_USD_PER_CHAR")
+    tts_per_char_override = os.getenv("SARVAM_TTS_INR_PER_CHAR")
     if tts_per_char_override:
         try:
-            tts_rate = float(tts_per_char_override)
+            tts_rate_inr = float(tts_per_char_override)
         except ValueError:
             pass
-    tts_usd = tts_characters * tts_rate
-    tts_inr = tts_usd * inr_per_usd
+    tts_inr = tts_characters * tts_rate_inr
+    tts_usd = tts_inr / inr_per_usd
 
     # Gemini LLM — native USD per 1M tokens.
     llm_rates = PRICING["llm_usd"].get(llm_model, PRICING["llm_usd"]["_default"])
@@ -434,7 +436,7 @@ async def export_call_token_usage(
     agent_name: str = "default_agent",
     call_duration_s: float = 0.0,
 ) -> None:
-    """Append one row to token_logs/<date>/token_logs_<agent>_sarvam_gemini_murf.csv."""
+    """Append one row to token_logs/<date>/token_logs_<agent>_sarvam_gemini_sarvam.csv."""
     try:
         path = getattr(websocket.url, "path", "") or ""
         custom_field = unquote(path.split("/")[-1]) if path else "Unknown"
@@ -461,7 +463,7 @@ async def export_call_token_usage(
         )
         log_dir = os.path.join(project_root, "token_logs", date_str)
         os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"token_logs_{agent_name}_sarvam_gemini_murf.csv")
+        log_file = os.path.join(log_dir, f"token_logs_{agent_name}_sarvam_gemini_sarvam.csv")
         file_exists = os.path.exists(log_file)
 
         if call_duration_s > 0:
@@ -612,48 +614,46 @@ def _get_bool_env(name: str, default: bool) -> bool:
     return val.lower() in ("true", "1", "yes", "on")
 
 
-def _resolve_murf(language: str) -> dict:
-    """Mirror the other agents' Murf resolver so the same .env works.
+def _resolve_sarvam_tts(language: str) -> dict:
+    """Resolve Sarvam Bulbul TTS config from env vars.
 
-    Reads MURF_VOICE_ID (plain string OR JSON dict with
-    voice_id / style / model / rate / pitch / variation), plus overrides
-    from MURF_STYLE / MURF_MODEL / MURF_RATE / MURF_PITCH / MURF_VARIATION.
+    Reads SARVAM_TTS_MODEL, SARVAM_TTS_VOICE, SARVAM_TTS_PACE,
+    SARVAM_TTS_PITCH, SARVAM_TTS_LOUDNESS, SARVAM_TTS_TEMPERATURE.
     """
+    model = os.getenv("SARVAM_TTS_MODEL", "bulbul:v2").lower()
+    if model not in ("bulbul:v2", "bulbul:v3-beta", "bulbul:v3"):
+        model = "bulbul:v2"
+
+    default_voice = "anushka" if model == "bulbul:v2" else "aditya"
     res = {
-        "voice_id": "en-US-natalie",
-        "style": os.getenv("MURF_STYLE", "Conversational"),
-        "model": os.getenv("MURF_MODEL", "FALCON").upper(),
-        "rate": 0,
-        "pitch": 0,
-        "variation": 1,
+        "model": model,
+        "voice": os.getenv("SARVAM_TTS_VOICE", default_voice),
+        "language": language,
     }
 
-    env_voice = os.getenv("MURF_VOICE_ID")
-    if env_voice:
+    def _try_float(name):
+        raw = os.getenv(name)
+        if raw is None:
+            return None
         try:
-            parsed = json.loads(env_voice)
-            if isinstance(parsed, dict):
-                for k in ("voice_id", "style", "model", "rate", "pitch", "variation"):
-                    if k in parsed:
-                        res[k] = parsed[k] if k != "model" else str(parsed[k]).upper()
-            else:
-                res["voice_id"] = env_voice
-        except json.JSONDecodeError:
-            res["voice_id"] = env_voice
+            return float(raw)
+        except ValueError:
+            return None
 
-    # Env-var overrides win over JSON values.
-    for key, cast in (("MURF_RATE", int), ("MURF_PITCH", int), ("MURF_VARIATION", int)):
-        raw = os.getenv(key)
-        if raw:
-            try:
-                res[key.split("_")[1].lower()] = cast(raw)
-            except ValueError:
-                pass
-
-    if res["model"] not in ("FALCON", "GEN2"):
-        res["model"] = "FALCON"
-
-    res["locale"] = language
+    pace = _try_float("SARVAM_TTS_PACE")
+    if pace is not None:
+        res["pace"] = pace
+    if model == "bulbul:v2":
+        pitch = _try_float("SARVAM_TTS_PITCH")
+        loudness = _try_float("SARVAM_TTS_LOUDNESS")
+        if pitch is not None:
+            res["pitch"] = pitch
+        if loudness is not None:
+            res["loudness"] = loudness
+    else:
+        temperature = _try_float("SARVAM_TTS_TEMPERATURE")
+        if temperature is not None:
+            res["temperature"] = temperature
     return res
 
 
@@ -705,22 +705,22 @@ async def run_simple_agent(
     if hasattr(llm, "_ensure_cache"):
         asyncio.create_task(llm._ensure_cache())
 
-    # --- TTS: Murf (same env-parsing behavior as the other agents) ------
-    murf = _resolve_murf(language)
-    logger.info(f"[murf] {murf}")
-    tts = MurfTTSService(
-        api_key=_require("MURF_API_KEY"),
-        params=MurfTTSService.InputParams(
-            voice_id=murf["voice_id"],
-            style=murf["style"],
-            rate=murf["rate"],
-            pitch=murf["pitch"],
-            sample_rate=8000,
-            format="PCM",
-            model=murf["model"],
-            locale=murf["locale"],
-            variation=murf["variation"],
-        ),
+    # --- TTS: Sarvam Bulbul (WebSocket streaming) -----------------------
+    sarvam_tts_cfg = _resolve_sarvam_tts(language)
+    logger.info(f"[sarvam-tts] {sarvam_tts_cfg}")
+    tts_settings_kwargs = dict(
+        model=sarvam_tts_cfg["model"],
+        voice=sarvam_tts_cfg["voice"],
+        language=sarvam_tts_cfg["language"],
+        min_buffer_size=30,
+    )
+    for k in ("pace", "pitch", "loudness", "temperature"):
+        if k in sarvam_tts_cfg:
+            tts_settings_kwargs[k] = sarvam_tts_cfg[k]
+    tts = SarvamTTSService(
+        api_key=_require("SARVAM_API_KEY"),
+        sample_rate=8000,
+        settings=SarvamTTSService.Settings(**tts_settings_kwargs),
     )
 
     initial_messages = []
@@ -812,6 +812,6 @@ async def run_simple_agent(
         await export_call_token_usage(
             websocket,
             metrics_accumulator,
-            agent_name="simple_agent",
+            agent_name="simple_sarvam_agent",
             call_duration_s=call_duration_s,
         )
