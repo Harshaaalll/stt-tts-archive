@@ -694,7 +694,7 @@ async def run_simple_agent(
             model=os.getenv("SARVAM_STT_MODEL", "saarika:v2.5"),
             language=_LANGUAGE_MAP.get(language, Language.EN_IN),
             vad_signals=True,
-            high_vad_sensitivity=False,
+            high_vad_sensitivity=True,
         ),
         keepalive_timeout=10.0,
         ttfs_p99_latency=0.35,
