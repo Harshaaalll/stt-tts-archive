@@ -354,6 +354,7 @@ PRICING = {
     # Murf TTS — native USD per character
     "tts_murf_per_char_usd": {
         "FALCON":   10.0 / 1_000_000.0,  # $10 / 1M characters
+        "FALCON-2": 10.0 / 1_000_000.0,  # $10 / 1M characters
         "GEN2":     30.0 / 1_000_000.0,  # $30 / 1M characters
         "_default": 10.0 / 1_000_000.0,
     },
@@ -575,7 +576,10 @@ def _build_vad() -> SileroVADAnalyzer:
     # Fixed confidence + minimum floor on start_secs to prevent phantom turn-start
     # storms when the env has an aggressive value like 0.01. Env can still raise
     # start_secs above the floor.
-    confidence = 0.8
+    try:
+        confidence = float(os.getenv("VAD_CONFIDENCE", "0.8"))
+    except ValueError:
+        confidence = 0.8
     try:
         start_secs = max(float(os.getenv("VAD_START_SECS", "0.2")), 0.15)
     except ValueError:
@@ -650,7 +654,12 @@ def _resolve_murf(language: str) -> dict:
             except ValueError:
                 pass
 
-    if res["model"] not in ("FALCON", "GEN2"):
+    model_upper = res["model"].upper()
+    if model_upper in ("FALCON-2", "FALCON_2"):
+        res["model"] = "falcon-2"
+    elif model_upper == "GEN2":
+        res["model"] = "GEN2"
+    else:
         res["model"] = "FALCON"
 
     res["locale"] = language
@@ -694,7 +703,7 @@ async def run_simple_agent(
             model=os.getenv("SARVAM_STT_MODEL", "saarika:v2.5"),
             language=_LANGUAGE_MAP.get(language, Language.EN_IN),
             vad_signals=True,
-            high_vad_sensitivity=True,
+            high_vad_sensitivity=False,
         ),
         keepalive_timeout=10.0,
         ttfs_p99_latency=0.35,
