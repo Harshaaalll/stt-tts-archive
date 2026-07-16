@@ -34,7 +34,11 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TTSSpeakFrame,
     LLMRunFrame,
+    LLMFullResponseStartFrame,
+    LLMFullResponseEndFrame,
+    LLMTextFrame,
     MetricsFrame,
+    InputAudioRawFrame,
 )
 from pipecat.metrics.metrics import (
     LLMUsageMetricsData,
@@ -68,6 +72,9 @@ from pipecat.turns.user_start import VADUserTurnStartStrategy
 from pipecat.turns.user_start.transcription_user_turn_start_strategy import (
     TranscriptionUserTurnStartStrategy,
 )
+from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
+    MinWordsUserTurnStartStrategy,
+)
 from pipecat.turns.user_mute.base_user_mute_strategy import BaseUserMuteStrategy
 from pipecat.frames.frames import BotStartedSpeakingFrame, BotStoppedSpeakingFrame
 
@@ -96,6 +103,30 @@ class TranscriptLogger(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame):
             logger.info(f"[STT final]   {frame.text!r}")
+        await self.push_frame(frame, direction)
+
+
+class InputAudioGate(FrameProcessor):
+    """Drops incoming user audio frames while closed.
+
+    Placed right after transport.input() to isolate the greeting phase from
+    STT/VAD/aggregator entirely. While the greeting plays, no user audio
+    reaches Sarvam or Silero — so no phantom transcripts and no state
+    corruption. Opened on the first assistant_turn_stopped event.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._open = False
+
+    def open(self):
+        self._open = True
+        logger.info("[input-gate] OPEN (user audio flows to STT)")
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if not self._open and isinstance(frame, InputAudioRawFrame):
+            return  # drop user audio while closed
         await self.push_frame(frame, direction)
 
 
@@ -577,7 +608,14 @@ def _build_vad() -> SileroVADAnalyzer:
     # Fixed confidence + minimum floor on start_secs to prevent phantom turn-start
     # storms when the env has an aggressive value like 0.01. Env can still raise
     # start_secs above the floor.
-    confidence = 0.8
+    # Silero VAD confidence — 0.7 is a middle ground for 8kHz phone audio.
+    # Higher (0.9) misses real speech; lower (0.5) picks up bot echo/noise.
+    # Env can override. NOTE: with vad_signals=False on Sarvam, Silero is the
+    # sole VAD source, so it MUST detect real speech reliably.
+    try:
+        confidence = float(os.getenv("VAD_CONFIDENCE", "0.7"))
+    except ValueError:
+        confidence = 0.7
     try:
         start_secs = max(float(os.getenv("VAD_START_SECS", "0.2")), 0.15)
     except ValueError:
@@ -686,15 +724,18 @@ async def run_simple_agent(
     )
 
     # --- STT: Sarvam Saarika streaming ----------------------------------
-    # `vad_signals=True` is required — without it, Sarvam never emits
-    # end-of-utterance signals and no transcript is ever produced.
+    # vad_signals=False puts Sarvam in flush-mode: Silero VAD drives turn
+    # boundaries, Sarvam only finalizes when we call flush(). Avoids Sarvam
+    # broadcasting phantom UserStartedSpeakingFrame + broadcast_interruption
+    # during bot-audio bleed, which was silently dropping the user's first
+    # transcript by corrupting aggregator state.
     stt = SarvamSTTService(
         api_key=_require("SARVAM_API_KEY"),
         settings=SarvamSTTService.Settings(
             model=os.getenv("SARVAM_STT_MODEL", "saarika:v2.5"),
             language=_LANGUAGE_MAP.get(language, Language.EN_IN),
-            vad_signals=True,
-            high_vad_sensitivity=True,
+            vad_signals=False,
+            high_vad_sensitivity=False,
         ),
         keepalive_timeout=10.0,
         ttfs_p99_latency=0.35,
@@ -737,7 +778,10 @@ async def run_simple_agent(
             user_turn_strategies=UserTurnStrategies(
                 start=[
                     VADUserTurnStartStrategy(),
-                    TranscriptionUserTurnStartStrategy(use_interim=False),
+                    # Filter backchannels ("अच्छा", "हाँ", "जी") during bot speech
+                    # so they don't interrupt/re-trigger the LLM. When the bot is
+                    # silent, single-word user replies still work (min drops to 1).
+                    MinWordsUserTurnStartStrategy(min_words=3, use_interim=False),
                 ],
                 stop=[CustomSpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.1)],
             ),
@@ -763,9 +807,15 @@ async def run_simple_agent(
     async def on_user_turn_idle(aggregator):
         logger.info("[aggregator] User turn idle")
 
+    input_gate = InputAudioGate()
+
     @asst_agg.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message):
         logger.info(f"[aggregator] Assistant turn stopped: {message.content!r}")
+        # Open the audio gate when the greeting finishes so the conversation
+        # can begin. Idempotent — subsequent turns are no-ops.
+        if not input_gate._open:
+            input_gate.open()
 
     transcript_logger = TranscriptLogger()
     metrics_accumulator = CallMetricsAccumulator()
@@ -773,6 +823,7 @@ async def run_simple_agent(
     # --- pipeline (no extras) -------------------------------------------
     pipeline = Pipeline([
         transport.input(),
+        input_gate,
         stt,
         transcript_logger,
         tracer_stt,
@@ -796,8 +847,17 @@ async def run_simple_agent(
         logger.info("Client connected")
         if greeting_text:
             logger.info(f"Speaking greeting: {greeting_text!r}")
-            await task.queue_frame(TTSSpeakFrame(greeting_text))
-        await task.queue_frame(LLMRunFrame())
+            # Push as a fake LLM response so the assistant aggregator tracks it
+            # as a proper turn (start/text/end). TTSSpeakFrame skips this
+            # lifecycle, which corrupts user-turn state and swallows the user's
+            # first response during the greeting.
+            await task.queue_frames([
+                LLMFullResponseStartFrame(),
+                LLMTextFrame(greeting_text),
+                LLMFullResponseEndFrame(),
+            ])
+        else:
+            await task.queue_frame(LLMRunFrame())
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnected(_t, _c):
