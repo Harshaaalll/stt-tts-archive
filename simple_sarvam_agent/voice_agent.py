@@ -764,10 +764,16 @@ async def run_simple_agent(
         settings=SarvamTTSService.Settings(**tts_settings_kwargs),
     )
 
+    from pipecat.turns.user_mute.mute_until_first_bot_complete_user_mute_strategy import MuteUntilFirstBotCompleteUserMuteStrategy
+
     initial_messages = []
     if dynamic_instruction:
         initial_messages.append(
             {"role": "user", "content": dynamic_instruction}
+        )
+    if greeting_text:
+        initial_messages.append(
+            {"role": "assistant", "content": greeting_text}
         )
     context = LLMContext(messages=initial_messages)
     user_agg, asst_agg = LLMContextAggregatorPair(
@@ -785,7 +791,9 @@ async def run_simple_agent(
                 ],
                 stop=[CustomSpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.1)],
             ),
-            user_mute_strategies=[],
+            user_mute_strategies=[
+                MuteUntilFirstBotCompleteUserMuteStrategy(),
+            ],
         ),
     )
 
