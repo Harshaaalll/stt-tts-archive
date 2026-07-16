@@ -243,8 +243,8 @@ The difference: the right version picks up THEIR specific detail (kidney) and bu
 You have an unlimited vocabulary. Do not cycle through a fixed list. Each empathy response
 should feel like it was written ONLY for what this customer just told you.
 
-**4. Never repeat the settlement/senior manager pitch in the same words.**
-Each time you mention the senior manager callback, frame it differently:
+**4. Never repeat the repayment-restart pitch in the same words.**
+Each time you push for the PTP, frame it differently:
 - First mention: introduce the idea casually as one possible option
 - Second mention: connect it to something specific the customer shared
 - Third mention: frame it as the logical next step given everything discussed
@@ -314,6 +314,7 @@ TONE_PRINCIPLES_MAP = {
     "fusion_explore_v1": TONE_PRINCIPLES_EXPLORE_V1,
     "fusion_emi_v1": TONE_PRINCIPLES_V1,
     "seed_fincap_emi_v1": TONE_PRINCIPLES_EXPLORE_V1,
+    "fusion_msme_v1": TONE_PRINCIPLES_EXPLORE_V1,
 }
 
 
@@ -325,21 +326,4 @@ def get_tone_principles(name, customer_context_):
     if not template:
         return ""
 
-    synthesis_guidelines = """
-### SPEECH SYNTHESIS & CONVERSATIONAL PROSODY GUIDELINES
-To guide the Murf Falcon neural TTS to sound natural and emotional, you must format all outputs according to these formatting and punctuation rules:
-
-1. **Empathetic Pauses & Hesitations**:
-   * Always use ellipses (`...`) when expressing sympathy, thinking, or showing hesitation. This tells the TTS engine to lower its pitch, sound softer, and introduce natural pauses.
-   * *Example*: "जी... मैं समझ सकता हूँ... बिज़नेस में नुकसान होना वाकई बहुत मुश्किल होता है..."
-2. **Friendly Intonation (Curving Pitch)**:
-   * Always end questions with a question mark (`?`) to force the TTS to curve the pitch upward at the end of the query.
-   * *Example*: "क्या मैं राहुल जी से बात कर रहा हूँ?"
-3. **Emphasis & High Energy**:
-   * Use exclamation marks (`!`) when starting a firm or high-energy sentence to trigger a decisive, assertive start.
-   * *Example*: "सूनिए! आपका भुगतान काफी समय से पेंडिंग है।"
-4. **Conversational Flow & Fillers**:
-   * Avoid formal, written text. Use conversational fillers at the start of your sentences to establish tone (e.g., "अरे...", "जी...", "हाँ...", "हाँ जी...").
-"""
-    combined_template = template + "\n" + synthesis_guidelines
-    return apply_language_directive(combined_template, customer_context_)
+    return apply_language_directive(template, customer_context_)

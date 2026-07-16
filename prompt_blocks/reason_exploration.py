@@ -137,6 +137,54 @@ them to talk to someone close. End the call gently. ESCALATE to supervisor immed
 
 
 # ==========================================
+# REASON EXPLORATION - VERSION EXPLORE_V2_ACKNOWLEDGE
+# ==========================================
+REASON_EXPLORATION_EXPLORE_V2_ACKNOWLEDGE = """
+### PHASE 3 — ACKNOWLEDGE KNOWN REASON
+
+⚠️ The reason for non-payment is ALREADY KNOWN from prior calls. Do NOT re-ask why they
+haven't paid — that discovery has already happened.
+
+**Goal:** Open by naturally acknowledging what you already know, then move quickly into the
+repayment-restart conversation.
+
+**How to do it:**
+- Reference the known reason naturally and briefly, in your own words — do not sound like
+  you are reading it back verbatim. Example intent: "Pichli baar aapne bataya tha ki..."
+- Do NOT ask "kyun nahi bhar paaye" or any variant — that question has already been answered.
+- If the customer intelligence addendum for this call mentions any positive signals (e.g.
+  situation improving, new job, resolved family issue, cooperative tone) — reference that
+  signal genuinely as a reason for optimism before bridging to repayment.
+- Keep the acknowledgment brief — 1-2 sentences. Do not dwell on the old story.
+- Bridge quickly to the current conversation: understand if anything has changed since, then
+  push toward a repayment restart (PTP — at least ₹1500).
+
+⚠️ DO NOT BRING UP SETTLEMENT YOURSELF.
+The bridge you build is a bridge to RESTART REPAYMENTS (PTP — at least ₹1500), NOT to
+settlement. Settlement is only discussed if the customer themselves explicitly asks.
+
+---
+
+### PHASE 4 — CURRENT SITUATION ASSESSMENT
+
+**Goal:** Assess where the customer stands TODAY — income, employment, family support, other debts.
+
+**How to do it:**
+- Transition naturally from Phase 3. Do NOT suddenly switch to a checklist.
+- Pick up on clues already known from history and ask follow-ups only on what has changed.
+- Areas to cover through natural conversation (NOT as a rapid sequence of questions):
+  • Current income / work
+  • Employment type
+  • Other family members who earn
+  • Other debts or loans
+- Do NOT re-ask what is already known from prior calls or the narrative.
+"""
+# behavior : Agent skips reason-discovery questions when the reason is already known from
+# prior calls — opens by acknowledging it naturally, references positive signals from the
+# customer intelligence addendum if present, and bridges quickly to the repayment-restart ask.
+
+
+# ==========================================
 # REASON EXPLORATION - VERSION SEED_FINCAP_EMI_V1
 # ==========================================
 REASON_EXPLORATION_SEED_FINCAP_EMI_V1 = """
@@ -303,7 +351,9 @@ Phase 4 is complete ONLY when income and employment are known → then proceed t
 # ==========================================
 REASON_EXPLORATION_MAP = {
     "fusion_explore_v1": REASON_EXPLORATION_EXPLORE_V1,
+    "fusion_explore_v2_acknowledge": REASON_EXPLORATION_EXPLORE_V2_ACKNOWLEDGE,
     "seed_fincap_emi_v1": REASON_EXPLORATION_SEED_FINCAP_EMI_V1,
+    "fusion_msme_v1": REASON_EXPLORATION_EXPLORE_V1,
 }
 
 

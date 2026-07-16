@@ -22,6 +22,9 @@ NOT_CONNECTED_DISPOSITIONS = (
 def _extract_disposition(record):
     if not isinstance(record, dict):
         return ""
+    # Connected-call rows nest fields under "output"; not-connected rows are flat
+    if isinstance(record.get("output"), dict):
+        record = record["output"]
     for key in ("disposition", "result", "call_disposition"):
         value = record.get(key)
         if value:

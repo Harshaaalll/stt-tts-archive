@@ -654,6 +654,14 @@ def _resolve_murf(language: str) -> dict:
             except ValueError:
                 pass
 
+    model_override = os.getenv("MURF_MODEL")
+    if model_override:
+        res["model"] = model_override
+
+    style_override = os.getenv("MURF_STYLE")
+    if style_override:
+        res["style"] = style_override
+
     model_upper = res["model"].upper()
     if model_upper in ("FALCON-2", "FALCON_2"):
         res["model"] = "falcon-2"
@@ -732,10 +740,16 @@ async def run_simple_agent(
         ),
     )
 
+    from pipecat.turns.user_mute.mute_until_first_bot_complete_user_mute_strategy import MuteUntilFirstBotCompleteUserMuteStrategy
+
     initial_messages = []
     if dynamic_instruction:
         initial_messages.append(
             {"role": "user", "content": dynamic_instruction}
+        )
+    if greeting_text:
+        initial_messages.append(
+            {"role": "assistant", "content": greeting_text}
         )
     context = LLMContext(messages=initial_messages)
     user_agg, asst_agg = LLMContextAggregatorPair(
@@ -750,7 +764,9 @@ async def run_simple_agent(
                 ],
                 stop=[CustomSpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.1)],
             ),
-            user_mute_strategies=[],
+            user_mute_strategies=[
+                MuteUntilFirstBotCompleteUserMuteStrategy(),
+            ],
         ),
     )
 
@@ -806,7 +822,8 @@ async def run_simple_agent(
         if greeting_text:
             logger.info(f"Speaking greeting: {greeting_text!r}")
             await task.queue_frame(TTSSpeakFrame(greeting_text))
-        await task.queue_frame(LLMRunFrame())
+        else:
+            await task.queue_frame(LLMRunFrame())
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnected(_t, _c):

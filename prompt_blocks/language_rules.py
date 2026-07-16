@@ -111,6 +111,7 @@ LANGUAGE_RULES_MAP = {
     "fusion_explore_v1": LANGUAGE_RULES_V4,
     "fusion_emi_v1": LANGUAGE_RULES_V4,
     "seed_fincap_emi_v1": LANGUAGE_RULES_V4,
+    "fusion_msme_v1": LANGUAGE_RULES_V4,
 }
 
 def get_language_rules(name, customer_context_):
