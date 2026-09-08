@@ -156,3 +156,13 @@ Thumbs.db
 
 # Project-specific logs and tokens
 token_logs/
+
+# Sanwaad generated state (index is rebuilt on first run)
+sanwaad/data/policy_index.json
+sanwaad/data/sanwaad.sqlite
+sanwaad/data/mock_replies.json
+sanwaad/data/traces.jsonl
+sanwaad/data/feedback.jsonl
+
+# IDE
+.idea/
