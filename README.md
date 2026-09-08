@@ -11,8 +11,9 @@ Hindi, Hinglish and English. It contains two things:
   channel from one policy index, and emits a receipt proving both cited the
   same clauses.
 
-If you are here for the current work, read `sanwaad/README.md`. Everything
-above it in this file is the road that led there.
+If you are here for the current work, start at the Sanwaad section below.
+The pipelines after it are the road that led there, and the History section
+walks that road commit by commit.
 
 ## Quick start
 
@@ -30,6 +31,87 @@ python deepgram_gemini_murf/server.py   # a bake-off agent, port 7860
 
 The bake-off servers all bind port 7860 — run one at a time. Sanwaad is on
 7870, so it can run alongside any of them.
+
+## Sanwaad — the current project
+
+A public complaint and a support call are the same grievance arriving through
+two doors. Sanwaad runs both through **one LangGraph state machine** grounded
+in **one policy index**, so the posted reply and the spoken answer provably
+cite the same clauses — and it emits a receipt saying so.
+
+```
+Reddit / mock feed
+        │
+        ▼
+   ┌─ triage ──────────────┐  cheap model, every inbound item
+   │   severity floor      │  a severity-5 item is never dropped
+   ▼                       │
+ retrieve  ◄─── policy index (33 clauses, local ONNX embeddings, ₹0)
+        │
+        ▼
+    draft ──► ground_check ──┐  every claim must trace to a clause
+        ▲                    │  ungrounded → revise (max 2) → human
+        └────────────────────┘
+        │
+        ▼
+  review_gate ── interrupt() ──► human approves in the console
+        │                        (case parked in SQLite, survives restart)
+        ▼
+    publish ──► escalation ──► voice (WebRTC, same clauses) ──► close
+                                                                  │
+                                          consistency receipt ◄────┘
+```
+
+```bash
+python -m sanwaad.demo        # CLI walkthrough, no API key needed
+python -m sanwaad.api.server  # review console at http://localhost:7870
+pytest tests/ -q              # 22 tests, no key required
+```
+
+With no keys at all the graph, retrieval, gating and receipts are all real —
+only the model calls are stubbed. First run downloads a ~470MB ONNX embedding
+model; every later start is instant.
+
+**What it is made of**
+
+| Path | Does |
+|---|---|
+| `sanwaad/graph/` | State, nodes and edges — the phase machine |
+| `sanwaad/rag/` | Clause parsing, local ONNX embeddings, RRF fusion, agentic retrieval |
+| `sanwaad/policy/` | The knowledge base — plain markdown, `## [ID] Heading` |
+| `sanwaad/connectors/` | Reddit and a mock feed; adding a channel is one `Connector` |
+| `sanwaad/voice/` | The brief builder that bridges to the voice leg, and a WebRTC agent |
+| `sanwaad/api/` | FastAPI, the human review console, the call page |
+| `sanwaad/consistency.py` | The receipt, and the table of clause pairs that cannot both hold |
+
+**Three ideas worth stealing**
+
+1. **The consistency receipt.** The real failure of a support org is not a
+   wrong answer, it is *two* answers — social says seven days, the call centre
+   says three. Both channels retrieve from one index, so which clauses each
+   relied on is recorded and compared, and a contradiction is flagged
+   mechanically instead of being discovered in a screenshot.
+2. **Retrieval runs on triage's English summary, not the raw comment.**
+   Measured, not assumed: Latin-script Hinglish lands nowhere near English
+   policy text in this embedding space, so `"paise wapas nahi aaye"` misses the
+   refund clauses entirely. Triage already produces the summary, so the fix is
+   free.
+3. **Phases belong in edges, not in prompts.** The collections agents in this
+   repo carry a `_TERMINATE_TOOL_DESCRIPTION` full of capitalised FORBIDDEN
+   clauses — prompt engineering doing a control-flow job. Here the graph owns
+   the phase, so transitions are deterministic, inspectable and testable
+   without spending a token.
+
+**Cost and safety.** Triage runs on `gemini-2.5-flash-lite` for every item;
+drafting and grounding only run on genuine complaints; retrieval is local and
+free; voice runs on escalations only, over browser WebRTC with no per-minute
+telephony charge. Praise costs exactly one flash-lite call and stops.
+Auto-posting has to be earned — severity ≤ 2, fully grounded, no money
+promised, no private data needed — and `SANWAAD_ALLOW_POSTING` gates writes to
+real platforms, defaulting to off.
+
+Full detail, including the cost table and the layout, in
+[`sanwaad/README.md`](sanwaad/README.md).
 
 ## The pipelines
 
