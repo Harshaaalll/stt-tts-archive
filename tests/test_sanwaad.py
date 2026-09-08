@@ -15,24 +15,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sanwaad.config import REVIEW
 from sanwaad.consistency import build_receipt
-from sanwaad.graph.graph import _after_ground_check, _after_triage
-from sanwaad.graph.nodes import _largest_rupee_amount, _offline_triage, auto_post_allowed
+from sanwaad.graph.graph import _after_ground_check, _after_prioritise
+from sanwaad.graph.nodes import (
+    _largest_rupee_amount,
+    _offline_triage,
+    auto_post_allowed,
+    prioritise,
+)
 from sanwaad.rag.store import CATEGORY_CLAUSES, get_store
 from sanwaad.voice.brief import CitationTracker
 
 
 # --- Routing safety --------------------------------------------------------
 
+# The drop decision moved from `_after_triage` to `_after_prioritise` when the
+# judge and pattern agents landed: triage alone can no longer see enough to
+# close a case. The invariants below are the same two that mattered before.
+
+_CREDIBLE = {"authenticity": 0.9, "reach": 10, "reply_worthy": True,
+             "author_class": "customer", "history_with_brand": 0}
+_QUIET = {"level": "none", "cluster_size": 1}
+
+
 def test_high_severity_is_never_dropped_even_if_miscategorised():
     """The failure that ends a pilot: a regulatory threat classified as
     off-topic and silently closed with no reply."""
-    state = {"triage": {"is_complaint": False, "severity": 5, "category": "off_topic"}}
-    assert _after_triage(state) == "retrieve"
+    triage = {"is_complaint": False, "severity": 5, "category": "off_topic"}
+    p = prioritise(triage, _CREDIBLE, _QUIET)
+    assert p.drafting
+    assert _after_prioritise({"priority": p.model_dump()}) == "retrieve"
 
 
 def test_genuine_off_topic_still_closes_cheaply():
-    state = {"triage": {"is_complaint": False, "severity": 1, "category": "off_topic"}}
-    assert _after_triage(state) == "close"
+    triage = {"is_complaint": False, "severity": 1, "category": "off_topic"}
+    p = prioritise(triage, _CREDIBLE, _QUIET)
+    assert not p.drafting
+    assert _after_prioritise({"priority": p.model_dump()}) == "close"
 
 
 def test_regulatory_keywords_force_severity_5():

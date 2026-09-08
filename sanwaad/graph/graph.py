@@ -16,6 +16,9 @@ from .nodes import (
     draft_node,
     escalation_node,
     ground_check_node,
+    judge_node,
+    pattern_node,
+    prioritise_node,
     publish_node,
     retrieve_node,
     review_gate_node,
@@ -27,21 +30,15 @@ from .state import GrievanceState
 MAX_REVISIONS = 2
 
 
-def _after_triage(state: GrievanceState) -> str:
-    """Route past triage, with a floor that classification cannot undercut.
+def _after_prioritise(state: GrievanceState) -> str:
+    """The only place a case is dropped without a reply.
 
-    `is_complaint` alone is not safe to route on. A comment threatening the
-    RBI Ombudsman can be scored severity 5 and still land in an odd category,
-    and dropping it because the category looked wrong is precisely the failure
-    that ends up screenshotted. Severity is the safety signal; category is
-    only a retrieval hint. When they disagree, severity wins.
+    By this point three independent readings agree it is not worth drafting
+    for: triage found no grievance, the judge found no credible author, and
+    the pattern agent found nothing else like it. Any one of them alone would
+    be a bad reason to stay silent.
     """
-    triage = state.get("triage") or {}
-    if triage.get("severity", 1) >= 4:
-        return "retrieve"
-    if not triage.get("is_complaint"):
-        return "close"
-    return "retrieve"
+    return "retrieve" if (state.get("priority") or {}).get("drafting", True) else "close"
 
 
 def _after_ground_check(state: GrievanceState) -> str:
@@ -69,6 +66,9 @@ def build_graph(checkpointer=None):
     g = StateGraph(GrievanceState)
 
     g.add_node("triage", triage_node)
+    g.add_node("pattern", pattern_node)
+    g.add_node("judge", judge_node)
+    g.add_node("prioritise", prioritise_node)
     g.add_node("retrieve", retrieve_node)
     g.add_node("draft", draft_node)
     g.add_node("ground_check", ground_check_node)
@@ -79,7 +79,22 @@ def build_graph(checkpointer=None):
     g.add_node("close", close_node)
 
     g.add_edge(START, "triage")
-    g.add_conditional_edges("triage", _after_triage, {"retrieve": "retrieve", "close": "close"})
+    # Everything reaches the pattern agent, including praise and off-topic
+    # chatter. Triage used to close those immediately to save a call; it no
+    # longer may, because "nine people said something odd about the new
+    # checkout" is a signal even when not one of them filed a complaint, and
+    # the only node that can see it is the one holding the window. The saving
+    # was never real either: fingerprinting is an embedding, which is local
+    # and free, and the case still closes without a drafting call.
+    g.add_edge("triage", "pattern")
+    # pattern -> judge -> prioritise is a real dependency chain, not a
+    # preference: the judge's coordination signal ("how many other accounts
+    # posted this exact sentence") is a fact about the window, and only the
+    # pattern agent holds it.
+    g.add_edge("pattern", "judge")
+    g.add_edge("judge", "prioritise")
+    g.add_conditional_edges("prioritise", _after_prioritise,
+                            {"retrieve": "retrieve", "close": "close"})
     g.add_edge("retrieve", "draft")
     g.add_edge("draft", "ground_check")
     g.add_conditional_edges("ground_check", _after_ground_check,

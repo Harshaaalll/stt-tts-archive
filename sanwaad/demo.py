@@ -4,6 +4,10 @@
 
 Runs without any API key. With GOOGLE_API_KEY set it uses real Gemini for
 triage, drafting and grounding, and the printed cost stops being zero.
+
+The demo resets the listener's seen-store and the pattern agent's window
+before it starts, so a second run shows the same thing as the first. Both are
+memory that accumulates on purpose in production and would make a demo lie.
 """
 
 from __future__ import annotations
@@ -11,13 +15,16 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from .connectors import get_connector
+from .listener import SEEN_PATH, Listener
 from .llm import is_offline
+from .pattern import MEMORY_PATH
 from .pipeline import resume_case, run_case
 
-BOLD, DIM, GREEN, YELLOW, RED, RESET = (
-    "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[0m",
+BOLD, DIM, GREEN, YELLOW, RED, CYAN, RESET = (
+    "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[36m", "\033[0m",
 )
+
+TIER_COLOUR = {"crisis": RED, "priority": YELLOW, "routine": GREEN, "ignore": DIM}
 
 
 def rule(title: str = "") -> None:
@@ -26,33 +33,83 @@ def rule(title: str = "") -> None:
         print(f"{BOLD}{title}{RESET}")
 
 
+def _reset_memory() -> None:
+    for path in (MEMORY_PATH, SEEN_PATH):
+        path.unlink(missing_ok=True)
+
+
 async def main() -> int:
     if is_offline():
         print(f"{YELLOW}No GOOGLE_API_KEY — running the deterministic offline stub. "
-              f"The graph, retrieval, gating and receipts are all real; only the "
-              f"model calls are faked.{RESET}")
+              f"The listener, the judge, the pattern agent, retrieval, gating and "
+              f"the receipts are all real; only the model calls are faked.{RESET}")
 
-    complaints = await get_connector("mock").fetch()
+    _reset_memory()
 
-    rule("1. INBOUND")
-    for c in complaints[:3]:
-        print(f"  {c.author}: {c.text[:88]}…")
+    # 1 -----------------------------------------------------------------
+    rule("1. LISTEN — every comment, tagged or not")
+    heard = await Listener(channels=["mock"]).poll()
+    print(f"  {len(heard.complaints)} new items, {heard.untagged} of which never "
+          f"tagged the brand")
+    print(f"  {DIM}A mentions-based queue would have seen {len(heard.complaints) - heard.untagged}"
+          f" of these.{RESET}")
 
-    target = complaints[1]  # the Devanagari frozen-wallet case
-    rule(f"2. CASE — {target.author}")
-    print(f"  {target.text}\n")
+    # 2 -----------------------------------------------------------------
+    rule("2. JUDGE + PATTERN — who is speaking, and how many of them")
+    print(f"  {DIM}{'author':<20}{'reads as':<10}{'auth':>5}{'reach':>8}"
+          f"{'pattern':>9}{'n':>3}  decision{RESET}")
 
-    out = await run_case(target)
+    results = []
+    for complaint in heard.complaints:
+        out = await run_case(complaint)
+        state = out["state"]
+        verdict = state.get("verdict") or {}
+        pattern = state.get("pattern") or {}
+        priority = state.get("priority") or {}
+        tier = priority.get("tier", "?")
+        colour = TIER_COLOUR.get(tier, "")
+        level = pattern.get("level", "none")
+        # Pad before colouring: an ANSI escape counts toward an f-string's
+        # field width but occupies no columns, so a coloured cell silently
+        # knocks the rest of the row out of alignment.
+        level_cell = f"{level:>9}"
+        if level == "crisis":
+            level_cell = f"{RED}{level_cell}{RESET}"
+        print(f"  {complaint.author:<20}{verdict.get('author_class', '?'):<10}"
+              f"{verdict.get('authenticity', 0):>5.2f}{verdict.get('reach', 0):>8,}"
+              f"{level_cell}{pattern.get('cluster_size', 1):>3}  "
+              f"{colour}{tier:<8}{RESET}"
+              f"{DIM}{(priority.get('reasons') or [''])[0][:34]}{RESET}")
+        results.append((complaint, out))
+
+    ignored = [r for r in results if (r[1]["state"].get("priority") or {}).get("tier") == "ignore"]
+    crisis = [r for r in results if (r[1]["state"].get("pattern") or {}).get("level") == "crisis"]
+    print(f"\n  {len(ignored)} logged without a drafted reply; "
+          f"{len(crisis)} case(s) inside a detected incident.")
+    if crisis:
+        pattern = crisis[-1][1]["state"]["pattern"]
+        print(f"  {RED}CRISIS{RESET} — {pattern['cluster_size']} distinct people reported "
+              f"the same thing within {pattern['window_minutes']} minutes "
+              f"({pattern['velocity_per_hour']}/hr).")
+        print(f"  {DIM}No single one of those comments says 'there is an outage'. "
+              f"Only the set does.{RESET}")
+
+    # 3 -----------------------------------------------------------------
+    target, out = results[1]   # the Devanagari frozen-wallet case
     case_id, state = out["case_id"], out["state"]
     triage = state["triage"]
 
+    rule(f"3. GHOSTWRITER — {target.author}")
+    print(f"  {target.text}\n")
+    print(f"  judge     → {state['verdict']['author_class']}, "
+          f"authenticity {state['verdict']['authenticity']}")
     print(f"  triage    → {triage['category']}, severity {triage['severity']}, "
           f"reply in {triage['language']}")
     print(f"  retrieved → {[c['clause_id'] for c in state['citations'][:5]]}")
     print(f"\n  draft:\n    {state['draft']['text']}")
     print(f"  cites: {state['draft']['citations']}")
 
-    rule("3. REVIEW GATE")
+    rule("4. REVIEW GATE")
     if out["pending"]:
         print(f"  {RED}HELD{RESET} — {out['pending']['reason']}")
         print(f"  {DIM}A human approves in the console; the graph stays parked in "
@@ -64,7 +121,7 @@ async def main() -> int:
     else:
         print(f"  {GREEN}AUTO-APPROVED{RESET} — {state['review']['note']}")
 
-    rule("4. ESCALATION")
+    rule("5. ESCALATION → VOICE")
     esc = state.get("escalation") or {}
     if esc.get("needed"):
         for r in esc["reasons"]:
@@ -79,7 +136,7 @@ async def main() -> int:
     else:
         print("  none needed")
 
-    rule("5. CLOSURE")
+    rule("6. CLOSURE")
     closure = state["closure"]
     con = closure["consistency"]
     print(f"  resolved       {closure['resolved']}")

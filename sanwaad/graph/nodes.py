@@ -8,7 +8,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from ..caching import TRIAGE_CACHE
-from ..config import REVIEW, TIER_DRAFT, TIER_REASONING, TIER_TRIAGE
+from ..config import JUDGE, REVIEW, TIER_DRAFT, TIER_REASONING, TIER_TRIAGE
 from ..guardrails import check_complaint, check_reply
 from ..llm import format_citations, structured
 from ..obs import TRACER
@@ -18,6 +18,7 @@ from ..models import (
     Citation,
     Draft,
     GroundingVerdict,
+    Priority,
     Review,
     Triage,
     VoiceOutcome,
@@ -127,8 +128,12 @@ def _offline_triage(text: str) -> dict:
           "कट गए", "कटे", "शुल्क"), Category.BILLING),
         (("freeze", "frozen", "block", "kyc", "login", "locked", "फ्रीज",
           "ब्लॉक", "बंद", "लॉक"), Category.ACCOUNT_ACCESS),
-        (("down", "not working", "outage", "server", "डाउन", "चल नहीं"),
-         Category.SERVICE_OUTAGE),
+        # Payment-failure vocabulary. Without these the six-comment outage in
+        # the mock feed triages as off_topic severity 1 and the crisis path is
+        # unreachable offline — the stub hiding the feature it exists to show.
+        (("down", "not working", "outage", "server", "डाउन", "चल नहीं",
+          "failing", "failed", "fail ho", "stuck", "pending", "not received",
+          "nahi mila", "फेल", "अटक"), Category.SERVICE_OUTAGE),
         (("rude", "behaviour", "misbehav", "बदतमीज़", "बदतमीज"),
          Category.AGENT_BEHAVIOUR),
         (("privacy", "otp", "phishing", "ओटीपी", "धोखा"), Category.DATA_PRIVACY),
@@ -160,6 +165,237 @@ def _offline_triage(text: str) -> dict:
         "summary": f"Customer reports an issue in the {category.value} category: {text[:160]}",
         "entities": {},
         "needs_private_data": category is not Category.PRAISE,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pattern — what this looks like next to the others
+# ---------------------------------------------------------------------------
+
+async def pattern_node(state: GrievanceState) -> dict:
+    """Score the complaint against the recent window.
+
+    Runs before the judge because the judge needs a cross-case fact — how many
+    other accounts posted near-identical wording — and only the window knows
+    it. Neither agent can answer the other's question from one comment.
+    """
+    from ..pattern import detect
+
+    complaint = state["complaint"]
+    triage = state["triage"]
+
+    posted_at = None
+    try:
+        from datetime import datetime, timezone
+
+        posted_at = datetime.fromisoformat(complaint["created_at"])
+        if posted_at.tzinfo is None:
+            posted_at = posted_at.replace(tzinfo=timezone.utc)
+    except (KeyError, ValueError):
+        pass  # detect() falls back to now, which is right for a live comment
+
+    with TRACER.span("pattern", trace_id=state["case_id"]) as span:
+        signal, duplicates = detect(
+            case_id=state["case_id"],
+            author=complaint["author"],
+            category=triage["category"],
+            summary=triage["summary"],
+            text=complaint["text"],
+            at=posted_at,
+        )
+        span.set(level=signal.level, cluster=signal.cluster_size,
+                 velocity=signal.velocity_per_hour, duplicates=duplicates)
+
+    message = (
+        f"{signal.level}: {signal.cluster_size} distinct author(s) in "
+        f"{signal.window_minutes}m ({signal.velocity_per_hour}/hr)"
+        if signal.level != "none"
+        else "first of its kind in the window"
+    )
+    return {
+        "pattern": signal.model_dump(mode="json"),
+        "coordination": duplicates,
+        "events": [event("pattern", message, theme=signal.theme,
+                         related=signal.related_case_ids[:5])],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Judge — who is speaking
+# ---------------------------------------------------------------------------
+
+class AuthorSecondOpinion(BaseModel):
+    """Only used for the ambiguous band; see judge.needs_a_second_opinion."""
+
+    author_class: str = Field(description="customer, audience, troll, bot, competitor or unknown")
+    authenticity: float = Field(ge=0.0, le=1.0)
+    reasoning: str = ""
+
+
+_JUDGE_SYSTEM = """You are deciding whether a public comment about NimbusPay, an
+Indian UPI wallet, comes from someone with a real problem or from someone
+performing outrage.
+
+You are given the comment and the signals already computed from the account.
+The signals were inconclusive, which is why you were called.
+
+Judge the COMMENT, not its tone. Indian customers are direct, and anger is not
+evidence of bad faith — a person who has lost ₹18,000 is entitled to be
+furious. What separates a real grievance is whether anything in it could only
+be known by someone it actually happened to.
+
+Treat as REAL: a described sequence of events, a named merchant, an amount, a
+timeframe, a prior support interaction, a specific broken screen.
+Treat as PERFORMED: claims about the company's motives with no event attached,
+insults that would fit under any brand's post, demands to boycott, and
+copy-paste phrasing.
+
+Set `authenticity` 0.0-1.0. Do not round to the middle to be safe; an
+uncommitted score is the same as not being called."""
+
+
+def triage_wants_a_reply(state: GrievanceState) -> bool:
+    """Is there anything here a reply would address?"""
+    triage = state.get("triage") or {}
+    return bool(triage.get("is_complaint")) or int(triage.get("severity", 1)) >= 4
+
+
+async def judge_node(state: GrievanceState) -> dict:
+    """Read the author, then spend a model call only if the answer is close."""
+    from ..judge import assess, needs_a_second_opinion
+    from ..models import Complaint
+    from ..pattern import get_store
+
+    complaint = Complaint(**state["complaint"])
+    history = get_store().author_history(complaint.author,
+                                         exclude_case_id=state["case_id"])
+
+    verdict = assess(
+        complaint,
+        history_with_brand=history,
+        duplicate_authors=int(state.get("coordination") or 0),
+    )
+
+    cost = {"stage": "judge", "model": "rules", "usd": 0.0, "inr": 0.0,
+            "prompt_tokens": 0, "output_tokens": 0}
+
+    # Never buy an opinion we cannot act on: a compliment's author does not
+    # need adjudicating, whatever the account looks like.
+    worth_asking = triage_wants_a_reply(state) and needs_a_second_opinion(verdict)
+
+    if worth_asking:
+        r = route("triage")
+        opinion, cost = await structured(
+            model=r.model,
+            system=_JUDGE_SYSTEM,
+            user=(f"Comment by {complaint.author} on {complaint.channel.value}:\n"
+                  f"{complaint.text}\n\n"
+                  f"Signals already computed:\n- "
+                  + "\n- ".join(verdict.evidence or ["none"])),
+            schema=AuthorSecondOpinion,
+            temperature=0.0,
+            stage="judge",
+            offline_fallback={"author_class": verdict.author_class,
+                              "authenticity": verdict.authenticity,
+                              "reasoning": "offline mode: rules verdict kept"},
+        )
+        # The model may only move the verdict within the ambiguous band it was
+        # called for. Letting one call overturn hard account evidence — a
+        # ninety-minute-old throwaway — is how a persuasive troll gets promoted
+        # to a priority customer.
+        if opinion.author_class in ("customer", "audience", "troll", "bot",
+                                    "competitor", "unknown"):
+            verdict.author_class = opinion.author_class
+        verdict.authenticity = round(
+            max(JUDGE.ambiguous_low, min(JUDGE.ambiguous_high, opinion.authenticity)), 3)
+        verdict.evidence.append(f"model: {opinion.reasoning[:160]}")
+        verdict.reply_worthy = (
+            verdict.author_class != "bot"
+            and (verdict.authenticity >= JUDGE.reply_worthy_authenticity
+                 or verdict.reach >= JUDGE.reply_worthy_reach)
+        )
+
+    with TRACER.span("judge", trace_id=state["case_id"]) as span:
+        span.set(author_class=verdict.author_class, authenticity=verdict.authenticity,
+                 reach=verdict.reach, history=history,
+                 second_opinion=cost.get("model") != "rules")
+
+    return {
+        "verdict": verdict.model_dump(mode="json"),
+        "costs": [cost],
+        "events": [event(
+            "judge",
+            f"{verdict.author_class} / authenticity {verdict.authenticity} / "
+            f"reach {verdict.reach}"
+            + ("" if verdict.reply_worthy else " — not worth a drafted reply"),
+            evidence=verdict.evidence,
+        )],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prioritise — fold three readings into one decision
+# ---------------------------------------------------------------------------
+
+_PATTERN_WEIGHT = {"none": 0.0, "watch": 15.0, "crisis": 40.0}
+
+
+def prioritise(triage: dict, verdict: dict, pattern: dict) -> Priority:
+    """How urgent is this, and is it worth drafting for at all?
+
+    Severity says how bad it is for one person, the verdict says whose voice it
+    is, the pattern says whether it is one of many. A queue ordered by any one
+    of them alone is wrong in a way somebody notices: by severity alone the
+    outage arrives as forty separate tickets; by reach alone the loudest
+    account outranks the person who actually lost money.
+    """
+    reasons: list[str] = []
+    level = pattern.get("level", "none")
+    severity = int(triage.get("severity", 1))
+    authenticity = float(verdict.get("authenticity", 0.5))
+    reach = int(verdict.get("reach", 0))
+
+    score = severity * 10.0 + authenticity * 8.0
+    score += min(reach / 1000.0, 20.0)
+    score += _PATTERN_WEIGHT.get(level, 0.0)
+    if verdict.get("history_with_brand"):
+        score += 5.0
+        reasons.append("known customer with prior cases")
+
+    if level == "crisis":
+        reasons.append(f"crisis: {pattern.get('cluster_size')} authors reporting the same thing")
+        return Priority(tier="crisis", score=round(score, 1), reasons=reasons, drafting=True)
+
+    # Not worth drafting for. Note what this does NOT do: it does not delete
+    # the case or mark it handled. It is recorded, counted by the pattern
+    # agent, and visible in the console — because "we ignored it" and "we never
+    # saw it" are different failures, and only one of them is defensible.
+    if not verdict.get("reply_worthy", True):
+        reasons.append(f"{verdict.get('author_class')} with reach {reach}: logged, not answered")
+        return Priority(tier="ignore", score=round(score, 1), reasons=reasons, drafting=False)
+
+    if not triage.get("is_complaint") and severity < 4:
+        reasons.append("not a complaint")
+        return Priority(tier="ignore", score=round(score, 1), reasons=reasons, drafting=False)
+
+    if severity >= 4 or level == "watch" or reach >= JUDGE.reply_worthy_reach:
+        if severity >= 4:
+            reasons.append(f"severity {severity}")
+        if level == "watch":
+            reasons.append(f"{pattern.get('cluster_size')} similar in the last hour")
+        if reach >= JUDGE.reply_worthy_reach:
+            reasons.append(f"audience of {reach:,}")
+        return Priority(tier="priority", score=round(score, 1), reasons=reasons, drafting=True)
+
+    reasons.append("routine complaint")
+    return Priority(tier="routine", score=round(score, 1), reasons=reasons, drafting=True)
+
+
+async def prioritise_node(state: GrievanceState) -> dict:
+    p = prioritise(state["triage"], state.get("verdict") or {}, state.get("pattern") or {})
+    return {
+        "priority": p.model_dump(mode="json"),
+        "events": [event("prioritise", f"{p.tier} (score {p.score}): " + "; ".join(p.reasons))],
     }
 
 
@@ -238,6 +474,20 @@ async def draft_node(state: GrievanceState) -> dict:
             + "\n- ".join(grounding["unsupported_claims"])
         )
 
+    # Tell the writer what the pattern agent knows. Without this the reply says
+    # "let me look into your case" to the sixtieth person reporting one outage,
+    # which reads as a brand that has not noticed its own incident.
+    pattern = state.get("pattern") or {}
+    incident = ""
+    if pattern.get("level") in ("watch", "crisis"):
+        incident = (
+            f"\n\nKNOWN INCIDENT: {pattern.get('cluster_size')} other people have "
+            f"reported the same thing in the last {pattern.get('window_minutes')} minutes. "
+            "Acknowledge it as something we are already on, in one clause. Do not "
+            "give a fix time unless a clause states one, and do not imply this "
+            "person is the only one affected."
+        )
+
     user = f"""Customer comment ({triage['sentiment']}, severity {triage['severity']}):
 {state['complaint']['text']}
 
@@ -245,7 +495,7 @@ What they are reporting: {triage['summary']}
 reply_language: {triage['language']}
 
 Governing clauses:
-{format_citations(citations)}{correction}"""
+{format_citations(citations)}{incident}{correction}"""
 
     r = route("draft", severity=triage["severity"], revision=revision,
               injection_flagged=bool(state.get("injection_flagged")),
@@ -367,6 +617,11 @@ def auto_post_allowed(state: GrievanceState) -> tuple[bool, str]:
         return False, "resolution needs account data not available publicly"
     if state.get("injection_flagged"):
         return False, "complaint contains instruction-like text; never auto-post"
+    if (state.get("pattern") or {}).get("level") == "crisis":
+        # During an incident the individually-correct reply is the dangerous
+        # one: forty auto-posted apologies with slightly different wording IS
+        # the screenshot. One human decides the line, then everything uses it.
+        return False, "crisis pattern detected; incident replies go out under one human line"
     blocking = [g for g in (state.get("guardrails") or []) if g.get("severity") == "block"]
     if blocking:
         return False, f"guardrail block: {[g['rule'] for g in blocking]}"
@@ -486,6 +741,13 @@ async def escalation_node(state: GrievanceState) -> dict:
         reasons.append(f"disputed amount ₹{amount:,.0f} exceeds ₹2,000 (ESC-02)")
     if re.search(r"\b(call me|baat kar|phone|speak to|talk to someone)\b", text, re.I):
         reasons.append("customer explicitly asked to speak to someone (ESC-02)")
+
+    # A verified customer caught in a live incident gets the call, whatever
+    # their individual severity says. Their problem is not small; it is early.
+    pattern = state.get("pattern") or {}
+    verdict = state.get("verdict") or {}
+    if pattern.get("level") == "crisis" and verdict.get("author_class") == "customer":
+        reasons.append(f"crisis cluster of {pattern.get('cluster_size')} and a confirmed customer")
 
     needed = bool(reasons)
     return {

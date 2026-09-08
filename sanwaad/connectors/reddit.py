@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 from loguru import logger
 
-from ..models import Channel, Complaint
+from ..models import AuthorMeta, Channel, Complaint
 from .base import Connector
 
 
@@ -50,8 +50,40 @@ class RedditConnector(Connector):
                 text=f"{post.title}\n\n{body}".strip(),
                 url=f"https://reddit.com{post.permalink}",
                 created_at=datetime.fromtimestamp(post.created_utc, timezone.utc).isoformat(),
+                author_meta=await self._author_meta(post),
             ))
         return out
+
+    @staticmethod
+    async def _author_meta(post) -> AuthorMeta:
+        """What Reddit will tell us about the poster.
+
+        Best-effort by design. Fetching an author costs a request and can fail
+        on deleted or suspended accounts, and the judge treats every missing
+        field as carrying no weight rather than as a negative — so losing this
+        degrades the verdict's confidence, never its safety.
+        """
+        author = getattr(post, "author", None)
+        if author is None:
+            return AuthorMeta()
+        try:
+            await author.load()
+            created = getattr(author, "created_utc", None)
+            age_days = None
+            if created:
+                age_days = int(
+                    (datetime.now(timezone.utc)
+                     - datetime.fromtimestamp(created, timezone.utc)).days
+                )
+            return AuthorMeta(
+                account_age_days=age_days,
+                karma=(getattr(author, "link_karma", 0) or 0)
+                + (getattr(author, "comment_karma", 0) or 0),
+                verified=bool(getattr(author, "verified", False)),
+            )
+        except Exception as exc:
+            logger.debug(f"[reddit] could not load author for {post.id}: {exc}")
+            return AuthorMeta()
 
     async def reply(self, external_id: str, text: str) -> dict:
         if os.getenv("SANWAAD_ALLOW_POSTING", "").lower() not in ("1", "true", "yes"):

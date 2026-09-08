@@ -39,23 +39,41 @@ two doors. Sanwaad runs both through **one LangGraph state machine** grounded
 in **one policy index**, so the posted reply and the spoken answer provably
 cite the same clauses — and it emits a receipt saying so.
 
+Four agents read every comment before a word is written, because a comment
+read alone does not contain what a reply needs:
+
+| Agent | Question | Why one comment cannot answer it |
+|---|---|---|
+| **listener** | Is anyone talking about us, tagged or not? | A mentions queue only sees the people polite enough to @ you |
+| **judge** | Customer, audience, troll or bot? | The words are identical; the account is not |
+| **pattern** | Is this the ninth of these? | No single comment says "there is an outage" |
+| **ghostwriter** | What do we say that is true, in our voice? | — |
+
 ```
-Reddit / mock feed
+every platform, tagged or not
+        │
+        ▼
+   listener ─────────────►  dedupe, mark untagged
         │
         ▼
    ┌─ triage ──────────────┐  cheap model, every inbound item
    │   severity floor      │  a severity-5 item is never dropped
    ▼                       │
+  pattern  ──►  judge  ──►  prioritise
+   how many        who is      one queue order, and the only place
+   of these?       saying it   a case is dropped unanswered
+        │
+        ▼
  retrieve  ◄─── policy index (33 clauses, local ONNX embeddings, ₹0)
         │
         ▼
-    draft ──► ground_check ──┐  every claim must trace to a clause
-        ▲                    │  ungrounded → revise (max 2) → human
-        └────────────────────┘
+ghostwriter ──► ground_check ──┐  every claim must trace to a clause
+        ▲                      │  ungrounded → revise (max 2) → human
+        └──────────────────────┘
         │
         ▼
   review_gate ── interrupt() ──► human approves in the console
-        │                        (case parked in SQLite, survives restart)
+        │                        (a crisis ALWAYS stops here)
         ▼
     publish ──► escalation ──► voice (WebRTC, same clauses) ──► close
                                                                   │
@@ -65,7 +83,7 @@ Reddit / mock feed
 ```bash
 python -m sanwaad.demo        # CLI walkthrough, no API key needed
 python -m sanwaad.api.server  # review console at http://localhost:7870
-pytest tests/ -q              # 22 tests, no key required
+pytest tests/ -q              # 102 tests, no key required
 ```
 
 With no keys at all the graph, retrieval, gating and receipts are all real —
@@ -76,6 +94,9 @@ model; every later start is instant.
 
 | Path | Does |
 |---|---|
+| `sanwaad/listener.py` | Multi-channel polling, dedupe, untagged-mention detection |
+| `sanwaad/judge.py` | Author scoring — signals, bands, the reply-worthy rule |
+| `sanwaad/pattern.py` | The cross-case window, clustering, crisis levels |
 | `sanwaad/graph/` | State, nodes and edges — the phase machine |
 | `sanwaad/rag/` | Clause parsing, local ONNX embeddings, RRF fusion, agentic retrieval |
 | `sanwaad/policy/` | The knowledge base — plain markdown, `## [ID] Heading` |
@@ -84,7 +105,7 @@ model; every later start is instant.
 | `sanwaad/api/` | FastAPI, the human review console, the call page |
 | `sanwaad/consistency.py` | The receipt, and the table of clause pairs that cannot both hold |
 
-**Three ideas worth stealing**
+**Three ideas worth stealing** (the four agents are covered in Sanwaad's own README)
 
 1. **The consistency receipt.** The real failure of a support org is not a
    wrong answer, it is *two* answers — social says seven days, the call centre
@@ -105,10 +126,13 @@ model; every later start is instant.
 **Cost and safety.** Triage runs on `gemini-2.5-flash-lite` for every item;
 drafting and grounding only run on genuine complaints; retrieval is local and
 free; voice runs on escalations only, over browser WebRTC with no per-minute
-telephony charge. Praise costs exactly one flash-lite call and stops.
-Auto-posting has to be earned — severity ≤ 2, fully grounded, no money
-promised, no private data needed — and `SANWAAD_ALLOW_POSTING` gates writes to
-real platforms, defaulting to off.
+telephony charge. Praise costs exactly one flash-lite call and stops. The
+listener, the pattern agent and the judge are I/O, a dot product and a scoring
+function respectively — adding them cost roughly nothing per comment and
+*removed* cost, since a troll no longer earns a drafting call. Auto-posting
+has to be earned — severity ≤ 2, fully grounded, no money promised, no private
+data needed, no crisis in progress — and `SANWAAD_ALLOW_POSTING` gates writes
+to real platforms, defaulting to off.
 
 Full detail, including the cost table and the layout, in
 [`sanwaad/README.md`](sanwaad/README.md).
@@ -192,7 +216,18 @@ By this point the phase machine lived inside the prompt: a
 what prompt engineering looks like when asked to do control flow. Sanwaad
 takes that job back — phases become graph edges, grounding becomes a gate a
 draft has to pass, and the written and spoken channels are made to retrieve
-from one clause index so they can be *proved* to agree. Details in
+from one clause index so they can be *proved* to agree.
+
+**Four agents in front of the graph** (2026-09-09)
+The first cut answered whatever it was handed, one comment at a time — which
+meant it drafted a careful grounded reply to an hour-old throwaway shouting
+"SCAM", and saw a six-person payment outage as six unrelated tickets. Three
+agents were added ahead of the writer, each answering a question no single
+comment contains: a **listener** that catches the brand being named rather
+than tagged, a **judge** that reads the account behind the words, and a
+**pattern** agent that counts distinct people saying the same thing inside a
+window. All three are free per comment — I/O, a scoring function, and a dot
+product against embeddings retrieval already computed. Details in
 [`sanwaad/README.md`](sanwaad/README.md).
 
 ## Configuration
@@ -209,6 +244,10 @@ feedback logs — is gitignored and rebuilt on first run.
 
 ```
 sanwaad/            the current project (own README)
+  listener.py       hears every platform, tagged or not
+  judge.py          reads who is speaking
+  pattern.py        counts how many are saying it
+  graph/            the state machine that writes and escalates
 tests/              pytest suite for the Sanwaad layer
 prompt_blocks/      composable system-prompt blocks
 <stt>_<llm>_<tts>/  one directory per pipeline combination

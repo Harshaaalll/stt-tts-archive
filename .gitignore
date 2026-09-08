@@ -161,6 +161,8 @@ token_logs/
 sanwaad/data/policy_index.json
 sanwaad/data/sanwaad.sqlite
 sanwaad/data/mock_replies.json
+sanwaad/data/pattern_memory.json
+sanwaad/data/listener_seen.json
 sanwaad/data/traces.jsonl
 sanwaad/data/feedback.jsonl
 

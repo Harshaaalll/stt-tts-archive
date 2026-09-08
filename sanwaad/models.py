@@ -37,6 +37,21 @@ class Category(str, Enum):
     OFF_TOPIC = "off_topic"
 
 
+class AuthorMeta(BaseModel):
+    """What the platform knows about whoever posted this.
+
+    Every field is optional because every platform exposes a different subset.
+    The judge degrades gracefully: a missing signal is not a negative one, it
+    just carries no weight.
+    """
+
+    account_age_days: Optional[int] = None
+    karma: Optional[int] = None
+    followers: Optional[int] = None
+    verified: bool = False
+    post_count: Optional[int] = None
+
+
 class Complaint(BaseModel):
     """One inbound item, normalised across connectors."""
 
@@ -48,6 +63,11 @@ class Complaint(BaseModel):
     created_at: str = Field(default_factory=_now)
     parent_text: Optional[str] = None  # thread context, when the connector has it
 
+    # Set by the listener when the brand was never @-mentioned. An untagged
+    # complaint is the norm, not the exception, and it is the one nobody sees.
+    tagged: bool = True
+    author_meta: AuthorMeta = Field(default_factory=AuthorMeta)
+
 
 class Triage(BaseModel):
     is_complaint: bool
@@ -58,6 +78,49 @@ class Triage(BaseModel):
     summary: str
     entities: dict[str, Any] = Field(default_factory=dict)
     needs_private_data: bool = False
+
+
+class AuthorVerdict(BaseModel):
+    """Who is saying this — the signal that decides how much a complaint costs us.
+
+    The same words carry different weight from a two-year-old account that has
+    bought from us twice and from an hour-old account posting the same line
+    under every launch. Both still get read; only one gets a drafted reply and
+    a callback.
+    """
+
+    author_class: Literal["customer", "audience", "troll", "bot", "competitor", "unknown"]
+    authenticity: float = Field(ge=0.0, le=1.0,
+                                description="0 manufactured outrage, 1 a real person with a real problem")
+    reach: int = Field(default=0, ge=0, description="audience-size proxy: followers, or karma when that is all we have")
+    history_with_brand: int = Field(default=0, ge=0, description="prior cases from this author")
+    evidence: list[str] = Field(default_factory=list)
+    reply_worthy: bool = True
+
+
+class PatternSignal(BaseModel):
+    """What this complaint looks like *next to the others*.
+
+    One person saying the app is down is a support ticket. Nine people saying
+    it within twenty minutes is an outage, and the difference is not visible
+    in any single comment — which is why triage cannot see it and this can.
+    """
+
+    level: Literal["none", "watch", "crisis"] = "none"
+    cluster_size: int = 1
+    window_minutes: int = 0
+    velocity_per_hour: float = 0.0
+    theme: str = ""
+    related_case_ids: list[str] = Field(default_factory=list)
+
+
+class Priority(BaseModel):
+    """Triage severity, author weight and pattern level folded into one call."""
+
+    tier: Literal["ignore", "routine", "priority", "crisis"]
+    score: float
+    reasons: list[str] = Field(default_factory=list)
+    drafting: bool = True   # spend a drafting call at all?
 
 
 class Citation(BaseModel):

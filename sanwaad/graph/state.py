@@ -19,6 +19,10 @@ class GrievanceState(TypedDict, total=False):
 
     # Stage outputs
     triage: Optional[dict]           # Triage
+    pattern: Optional[dict]          # PatternSignal — how this looks beside the others
+    coordination: int                # other accounts posting near-identical wording
+    verdict: Optional[dict]          # AuthorVerdict — who is speaking
+    priority: Optional[dict]         # Priority — the three readings folded together
     retrieval_query: str             # English summary actually used for search
     citations: list[dict]            # list[Citation]
     draft: Optional[dict]            # Draft

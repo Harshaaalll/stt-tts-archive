@@ -5,23 +5,41 @@ Sanwaad runs both through **one LangGraph state machine** grounded in **one
 policy index**, so the written reply and the spoken answer provably cite the
 same clauses — and it emits a receipt proving it.
 
+Four agents read every inbound comment before anything is written. Each exists
+because a single comment, read alone, does not contain what it needs:
+
+| Agent | Question it answers | Why triage cannot |
+|---|---|---|
+| **listener** | Is anyone talking about us, tagged or not? | A mentions queue only sees the people polite enough to @ you |
+| **judge** | Who is saying this — customer, audience, troll, bot? | The words are identical; the account is not |
+| **pattern** | Is this the ninth of these? | No single comment says "there is an outage" |
+| **ghostwriter** | What do we say, in our voice, that is true? | — |
+
 ```
-Reddit / mock feed
+every platform, tagged or not
+        │
+        ▼
+   listener ─────────────►  dedupe, mark untagged
         │
         ▼
    ┌─ triage ──────────────┐  cheap model, every inbound item
    │   severity floor      │  a severity-5 item is never dropped, whatever its category
    ▼                       │
+  pattern  ──►  judge  ──►  prioritise
+   how many        who is      one queue order, and the only
+   of these?       saying it   place a case is dropped unanswered
+        │
+        ▼
  retrieve  ◄─── policy index (33 clauses, local ONNX embeddings, ₹0)
         │
         ▼
-    draft ──► ground_check ──┐  every claim must trace to a clause
-        ▲                    │  ungrounded → revise (max 2) → human
-        └────────────────────┘
+ghostwriter ──► ground_check ──┐  every claim must trace to a clause
+        ▲                      │  ungrounded → revise (max 2) → human
+        └──────────────────────┘
         │
         ▼
   review_gate ── interrupt() ──► human approves in the console
-        │                        (case parked in SQLite, survives restart)
+        │                        (crisis ALWAYS stops here)
         ▼
     publish ──► escalation ──► voice (WebRTC, same clauses) ──► close
                                                                   │
@@ -38,13 +56,74 @@ only the model calls are stubbed.
 source .venv/bin/activate
 python -m sanwaad.demo          # CLI walkthrough
 python -m sanwaad.api.server    # console at http://localhost:7870
-pytest tests/ -q                # 22 tests, no key required
+pytest tests/ -q                # 102 tests, no key required
 ```
 
 First run downloads a ~470MB ONNX embedding model. Every later start is instant.
 
 Add `GOOGLE_API_KEY` to `.env` for real triage/drafting/grounding. Add
 `SARVAM_API_KEY` + `MURF_API_KEY` to place actual voice calls.
+
+## The four agents
+
+**Listener — the complaints that were never addressed to you.** The comments
+that damage a brand are almost never in the mentions tab. Someone writes "this
+app just ate ₹4,500" under a stranger's post and no notification is ever
+generated, because you were described rather than tagged. The listener searches
+for the brand being *named*, records which happened, and remembers what it has
+already handed downstream — a queue that re-opens a case on every poll
+double-replies in public, which is the one mistake a support account cannot
+take back. On our own feeds (the Play Store listing) the name is not required
+at all: there, "this app" is us.
+
+**Judge — the same words are not worth the same reply.** An hour-old account
+with no karma posting *"SCAM, they hang the site on purpose, BOYCOTT"* and a
+two-year-old account quoting a UTR are not the same event. The scoring is a
+function, not a model call: the signals are enumerable (account age, karma,
+prior cases, whether the text contains something only the aggrieved could
+know), and "why was this ignored?" needs a list of named signals as its
+answer, not a softmax. A model is bought exactly once, for the ambiguous
+middle band, and may only move the verdict *within* that band — otherwise one
+persuasive paragraph promotes a throwaway to a priority customer.
+
+Two rules that matter more than the score:
+
+- **Reach overrides suspicion.** The same accusation from a 61,000-follower
+  account still gets answered. Silence reads as confirmation, and the audience
+  is real even when the grievance is not. Judge the person to decide what to
+  *spend*; judge the audience to decide whether to *speak*.
+- **Anger is never evidence.** Indian customers are direct, and someone who
+  has lost ₹18,000 is entitled to be furious. Only outrage with nothing
+  checkable attached counts against an account.
+
+**Pattern — watch the wave, not the drop.** One person saying payments are
+failing is a ticket. Six people saying it inside twelve minutes is an incident,
+and that fact exists nowhere in any single comment. Two design choices carry
+this:
+
+- **It counts people, not posts.** One furious customer posting six times is
+  one furious customer. Collapsing to distinct authors before any threshold is
+  checked is the difference between an early-warning system and one that
+  panics at whoever is loudest.
+- **It costs nothing per comment.** Similarity is a dot product against
+  embeddings retrieval already computed. A detector that costs a token per
+  comment gets sampled, and a sampled detector misses the first ten minutes —
+  the only ten that matter.
+
+Velocity is measured over the span the cluster actually occupies, not the
+configured window, so three people in five minutes trips the alarm while the
+same three across a day do not. A detected crisis then does two things: it
+forces every reply through a human, because forty individually-correct
+auto-replies with slightly different wording *is* the screenshot; and it tells
+the ghostwriter, so the sixtieth person to report an outage is not told we
+will look into their case.
+
+**Ghostwriter — the reply, and the quiet part.** Writes in brand voice from
+retrieved clauses, cites what it used, and never states a timeline no clause
+supports. Meanwhile the real issue moves: escalation applies clause ESC-02 in
+code, and a confirmed customer caught in a live incident gets a callback
+whatever their individual severity said — their problem is not small, it is
+early.
 
 ## The three ideas worth stealing
 
@@ -76,10 +155,21 @@ testable without spending a token.
 
 | Stage | Model | Runs on |
 |---|---|---|
+| listener | none | free, every poll |
 | triage | `gemini-2.5-flash-lite` | every inbound item |
+| pattern | local ONNX | free, every inbound item |
+| judge | rules | free, every inbound item |
+| judge, second opinion | `gemini-2.5-flash-lite` | only the ambiguous band |
 | draft + grounding | `gemini-2.5-flash` | genuine complaints only |
 | retrieval | local ONNX | free, every turn, both channels |
 | voice | Sarvam STT + Gemini + Murf | escalations only |
+
+Note which of the four agents cost anything. The listener is I/O, the pattern
+agent is a dot product against vectors retrieval already needed, and the judge
+is a scoring function that buys one cheap opinion only when its own signals
+are inconclusive. Adding three agents to the pipeline added roughly nothing to
+the per-comment bill — and *removed* cost, because a troll no longer gets a
+drafting call and an off-topic comment never reaches one.
 
 Praise and off-topic comments cost exactly one flash-lite call and stop. The
 voice leg runs over browser WebRTC, which carries no per-minute telephony
@@ -92,18 +182,29 @@ in one comparable number rather than two dashboards.
 ## Safety posture
 
 Auto-posting is deliberately hard to earn: severity ≤ 2, fully grounded, no
-money promised, no private data needed. Everything else waits for a human.
+money promised, no private data needed, **and no crisis in progress**.
+Everything else waits for a human.
 An LLM posting an unsupervised apology about someone's money is the failure
 mode that ends a pilot. `SANWAAD_ALLOW_POSTING` gates writes to real
 platforms and defaults to off.
+
+One thing the judge deliberately does **not** do: mark a case handled. A
+comment ruled not worth answering is still triaged, still fingerprinted, still
+counted by the pattern agent and still visible in the console. "We ignored it"
+and "we never saw it" are different failures, and only one of them is
+defensible — so a troll's post still contributes to spotting the outage
+underneath it.
 
 ## Layout
 
 ```
 sanwaad/
-  config.py         model tiers, pricing, the auto-post policy
+  config.py         model tiers, pricing, the auto-post / judge / crisis policies
   models.py         domain types
   llm.py            structured calls + per-call cost, with an offline mode
+  listener.py       multi-channel polling, dedupe, untagged-mention detection
+  judge.py          author scoring — signals, bands, the reply-worthy rule
+  pattern.py        the cross-case window, clustering, crisis levels
   consistency.py    the receipt, and the contradiction table
   graph/            state, nodes, edges
   rag/              clause parsing, local ONNX embeddings, hybrid retrieval
@@ -113,6 +214,7 @@ sanwaad/
   policy/           the knowledge base — plain markdown, `## [ID] Heading`
 ```
 
-Adding a channel means writing one `Connector`; the state machine does not change.
+Adding a channel means writing one `Connector` and listing it in
+`SANWAAD_CHANNELS`; the state machine does not change.
 Adding a policy means dropping a markdown file into `policy/` and deleting
 `data/policy_index.json`.

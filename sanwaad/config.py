@@ -88,3 +88,64 @@ class ReviewPolicy:
 
 
 REVIEW = ReviewPolicy()
+
+
+@dataclass(frozen=True)
+class JudgePolicy:
+    """Thresholds for reading the author. Every number here is a product
+    decision, so they live together where a pilot customer can argue with them
+    rather than scattered through the scoring code."""
+
+    base_authenticity: float = 0.55   # assume good faith, then let evidence move it
+
+    # Specificity — the strongest positive signal, capped so detail cannot stack.
+    specificity_bonus: float = 0.18
+    max_specificity_signals: int = 3
+
+    # Account shape
+    new_account_days: int = 14
+    established_account_days: int = 365
+    throwaway_karma: int = 5
+    established_karma: int = 500
+    throwaway_posts: int = 3
+    karma_to_reach_divisor: int = 20
+
+    # History with us
+    max_history_bonus: float = 0.20
+
+    # Coordination
+    coordinated_duplicate_authors: int = 3
+
+    # Classification bands
+    troll_ceiling: float = 0.35
+    audience_floor: float = 0.55
+    ambiguous_low: float = 0.30
+    ambiguous_high: float = 0.55
+
+    # Whether to answer at all. Reach can override suspicion: an unfair post
+    # with a large audience still has to be answered in public.
+    reply_worthy_authenticity: float = 0.35
+    reply_worthy_reach: int = 5_000
+
+
+JUDGE = JudgePolicy()
+
+
+@dataclass(frozen=True)
+class CrisisPolicy:
+    """When does a set of complaints stop being tickets and become an incident?
+
+    Tuned to fire *early and cheaply*. A false "watch" costs a dashboard badge;
+    a missed crisis costs the trend everyone screenshots. The asymmetry is the
+    whole design.
+    """
+
+    window_minutes: int = 90          # how far back a cluster may reach
+    similarity: float = 0.72          # cosine floor for "the same complaint"
+    watch_cluster: int = 3            # cluster size that raises a watch
+    crisis_cluster: int = 6           # cluster size that declares a crisis
+    crisis_velocity_per_hour: float = 4.0   # ...or this rate, whichever trips first
+    max_history: int = 500            # fingerprints retained in the pattern store
+
+
+CRISIS = CrisisPolicy()
