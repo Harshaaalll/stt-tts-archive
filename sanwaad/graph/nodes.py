@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Optional
 
 from pydantic import BaseModel, Field
 
 from ..caching import TRIAGE_CACHE
-from ..config import JUDGE, REVIEW, TIER_DRAFT, TIER_REASONING, TIER_TRIAGE
+from ..config import JUDGE, REVIEW
+from ..context import minimal_text, untrusted, with_trust_rules
 from ..guardrails import check_complaint, check_reply
-from ..llm import format_citations, structured
+from ..llm import NON_CALL_MODELS, format_citations, structured
 from ..obs import TRACER
 from ..router import route
 from ..models import (
@@ -77,17 +79,24 @@ async def triage_node(state: GrievanceState) -> dict:
             span.set(cache="hit")
             result = Triage(**cached)
             cost = {"stage": "triage", "model": "cache", "usd": 0.0, "inr": 0.0,
-                    "prompt_tokens": 0, "output_tokens": 0}
+                    "prompt_tokens": 0, "output_tokens": 0, "attempts": 0}
         else:
             span.set(cache="miss")
             fallback = _offline_triage(text)
+            # Minimal, isolated context: no author handle, no identifiers, and
+            # the comment fenced off as data rather than pasted in as prose.
             result, cost = await structured(
                 model=r.model,
-                system=_TRIAGE_SYSTEM,
-                user=f"Comment by {complaint['author']} on {complaint['channel']}:\n\n{text}",
+                fallback_model=r.fallback,
+                system=with_trust_rules(_TRIAGE_SYSTEM),
+                user=(f"A public comment on {complaint['channel']}:\n\n"
+                      + untrusted("customer_comment", minimal_text(text))),
                 schema=Triage,
                 stage="triage",
                 offline_fallback=fallback,
+                max_output_tokens=r.max_output_tokens,
+                timeout_s=r.timeout_s,
+                trace_id=state["case_id"],
             )
             TRIAGE_CACHE.put(r.model, text, result.model_dump(mode="json"), namespace="triage")
         span.set(cost_inr=cost.get("inr", 0.0))
@@ -112,6 +121,21 @@ async def triage_node(state: GrievanceState) -> dict:
     }
 
 
+def _keyword_in(keyword: str, text: str) -> bool:
+    """Latin keywords must start at a word boundary.
+
+    Plain substring matching let "fee" fire inside "coffee", so a question
+    about filter coffee was triaged as a billing complaint. The trajectory
+    eval's out-of-scope scenario caught it; the golden set had carried that
+    exact sentence all along without anything checking the triage step.
+    Devanagari keeps substring matching, because its vowel signs are not word
+    characters to a regex and a boundary would split words mid-letter.
+    """
+    if keyword.isascii():
+        return re.search(r"(?<![a-z])" + re.escape(keyword), text) is not None
+    return keyword in text
+
+
 def _offline_triage(text: str) -> dict:
     """Keyword triage for keyless runs. Crude on purpose — it exists so the
     pipeline is demonstrable, not so it is good."""
@@ -122,7 +146,8 @@ def _offline_triage(text: str) -> dict:
     # stub that is.
     pairs = [
         (("double debit", "twice", "duplicate", "do baar", "दो बार",
-          "refund", "wapas", "reversal", "paise nahi", "return", "रिफंड",
+          "refund", "wapas", "reversal", "reverse", "come back", "not back",
+          "money back", "paise nahi", "return", "रिफंड",
           "वापस", "पैसे नहीं", "पैसा नहीं"), Category.REFUND),
         (("charge", "charged", "deduct", "kata", "fee", "extra", "चार्ज",
           "कट गए", "कटे", "शुल्क"), Category.BILLING),
@@ -142,7 +167,7 @@ def _offline_triage(text: str) -> dict:
     ]
     category = Category.OFF_TOPIC
     for keys, cat in pairs:
-        if any(k in low for k in keys):
+        if any(_keyword_in(k, low) for k in keys):
             category = cat
             break
 
@@ -277,24 +302,28 @@ async def judge_node(state: GrievanceState) -> dict:
     )
 
     cost = {"stage": "judge", "model": "rules", "usd": 0.0, "inr": 0.0,
-            "prompt_tokens": 0, "output_tokens": 0}
+            "prompt_tokens": 0, "output_tokens": 0, "attempts": 0}
 
     # Never buy an opinion we cannot act on: a compliment's author does not
     # need adjudicating, whatever the account looks like.
     worth_asking = triage_wants_a_reply(state) and needs_a_second_opinion(verdict)
 
     if worth_asking:
-        r = route("triage")
+        r = route("judge")
         opinion, cost = await structured(
             model=r.model,
-            system=_JUDGE_SYSTEM,
-            user=(f"Comment by {complaint.author} on {complaint.channel.value}:\n"
-                  f"{complaint.text}\n\n"
-                  f"Signals already computed:\n- "
+            fallback_model=r.fallback,
+            system=with_trust_rules(_JUDGE_SYSTEM),
+            user=(f"A comment on {complaint.channel.value}:\n"
+                  + untrusted("customer_comment", minimal_text(complaint.text))
+                  + "\n\nSignals already computed from the account (trusted):\n- "
                   + "\n- ".join(verdict.evidence or ["none"])),
             schema=AuthorSecondOpinion,
             temperature=0.0,
             stage="judge",
+            max_output_tokens=r.max_output_tokens,
+            timeout_s=r.timeout_s,
+            trace_id=state["case_id"],
             offline_fallback={"author_class": verdict.author_class,
                               "authenticity": verdict.authenticity,
                               "reasoning": "offline mode: rules verdict kept"},
@@ -488,13 +517,19 @@ async def draft_node(state: GrievanceState) -> dict:
             "person is the only one affected."
         )
 
+    # The comment AND the triage summary are untrusted: the summary was written
+    # by a model reading the comment, so anything the comment smuggled in can
+    # survive into it. Only the clauses are ours.
+    comment_block = untrusted("customer_comment", minimal_text(state["complaint"]["text"]))
+    summary_block = untrusted("triage_summary", triage["summary"])
     user = f"""Customer comment ({triage['sentiment']}, severity {triage['severity']}):
-{state['complaint']['text']}
+{comment_block}
 
-What they are reporting: {triage['summary']}
+What they are reporting:
+{summary_block}
 reply_language: {triage['language']}
 
-Governing clauses:
+Governing clauses (trusted policy):
 {format_citations(citations)}{incident}{correction}"""
 
     r = route("draft", severity=triage["severity"], revision=revision,
@@ -503,11 +538,15 @@ Governing clauses:
 
     result, cost = await structured(
         model=r.model,
-        system=_DRAFT_SYSTEM,
+        fallback_model=r.fallback,
+        system=with_trust_rules(_DRAFT_SYSTEM),
         user=user,
         schema=Draft,
         temperature=0.3,
         stage=f"draft{'_revision' if revision else ''}",
+        max_output_tokens=r.max_output_tokens,
+        timeout_s=r.timeout_s,
+        trace_id=state["case_id"],
         offline_fallback={
             "text": (
                 "Sorry about this — that is a genuinely frustrating position to be in. "
@@ -570,16 +609,31 @@ async def ground_check_node(state: GrievanceState) -> dict:
     draft = state["draft"]
     citations = [Citation(**c) for c in state["citations"]]
 
+    r = route("ground_check")
     result, cost = await structured(
-        model=TIER_DRAFT,
-        system=_GROUND_SYSTEM,
-        user=f"Proposed reply:\n{draft['text']}\n\nAvailable clauses:\n{format_citations(citations)}",
+        model=r.model,
+        fallback_model=r.fallback,
+        system=with_trust_rules(_GROUND_SYSTEM),
+        user=("Proposed reply:\n" + untrusted("model_draft", draft["text"])
+              + f"\n\nAvailable clauses (trusted policy):\n{format_citations(citations)}"),
         schema=GroundingVerdict,
         temperature=0.0,
         stage="ground_check",
+        max_output_tokens=r.max_output_tokens,
+        timeout_s=r.timeout_s,
+        trace_id=state["case_id"],
         offline_fallback={"grounded": True, "unsupported_claims": [],
                           "reasoning": "offline mode: not verified"},
     )
+
+    if cost.get("degraded"):
+        # The offline default says "grounded" so keyless demos flow. A checker
+        # that could not run in production has verified nothing, and
+        # "unverified" must never be read as "grounded". Send it to a person
+        # rather than looping the drafter against a checker that is down.
+        result = GroundingVerdict(grounded=False, unavailable=True,
+                                  unsupported_claims=["grounding check could not run"],
+                                  reasoning="every model attempt failed")
 
     return {
         "grounding": result.model_dump(mode="json"),
@@ -590,6 +644,160 @@ async def ground_check_node(state: GrievanceState) -> dict:
             else f"{len(result.unsupported_claims)} unsupported claim(s)",
             unsupported=result.unsupported_claims,
         )],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Plan — the ghostwriter's private half: propose the fix, validate it in code
+# ---------------------------------------------------------------------------
+
+class PlannedAction(BaseModel):
+    kind: str = Field(description="reversal or ticket")
+    reference: Optional[str] = Field(default=None, description="exact ledger reference, reversals only")
+    amount_inr: Optional[float] = Field(default=None, description="exact ledger amount, reversals only")
+    reason: str = Field(description="one plain sentence a reviewer can check")
+
+
+class ActionPlan(BaseModel):
+    actions: list[PlannedAction] = Field(default_factory=list)
+    reasoning: str = ""
+
+
+_PLAN_SYSTEM = """You propose the internal actions that would actually resolve a
+customer's complaint for NimbusPay, an Indian UPI wallet. You do not execute
+anything. Every proposal is checked by code against the ledger and approved by
+a person before anything happens, so propose what the facts support and nothing
+more.
+
+Available actions:
+- reversal: return ONE specific debit. Only for a transaction that appears in
+  the ledger results you are given, using its exact reference and amount.
+- ticket: open an internal ticket so a person follows up — when the fix is not
+  a reversal, or when the ledger could not be checked.
+
+Rules:
+- Never invent a reference or an amount. No ledger match, no reversal.
+- An ordinary settled payment is not reversible. A duplicate debit, or a failed
+  transfer whose money has not come back, may be.
+- `reason` is one plain sentence."""
+
+
+def _offline_plan(matches: list[dict], tool_errors: list[str], amounts: list[float]) -> dict:
+    """What a careful planner proposes, written as rules for keyless runs.
+
+    It proposes on any problem-shaped transaction — including ones the
+    validator will then refuse. That is deliberate: an offline stub that only
+    proposed valid actions would never exercise the validator, and the
+    validator is the part that has to hold when a real model gets it wrong.
+    """
+    actions = []
+    for m in matches:
+        if m["kind"] in ("duplicate_debit", "failed_transfer", "failed_payment"):
+            amount = next((a for a in amounts if abs(a - m["amount_inr"]) < 0.01), m["amount_inr"])
+            actions.append({
+                "kind": "reversal", "reference": m["reference"], "amount_inr": amount,
+                "reason": f"{m['kind'].replace('_', ' ')} of ₹{m['amount_inr']:,.0f} at {m['merchant']}",
+            })
+    if tool_errors:
+        actions.append({"kind": "ticket",
+                        "reason": "Ledger unavailable while planning; check the transaction manually"})
+    elif amounts and not matches:
+        actions.append({"kind": "ticket",
+                        "reason": "No matching transaction for this customer; ask for the reference privately"})
+    return {"actions": actions, "reasoning": "offline mode: rule-based plan"}
+
+
+async def plan_node(state: GrievanceState) -> dict:
+    """Gather facts, let the model propose, then validate every proposal in code.
+
+    The ledger is searched BEFORE the model is asked, with keys the system
+    controls — the author's handle, and amounts and references parsed from the
+    comment. The model reasons over facts it was handed; it is not given a tool
+    and trusted to look things up well.
+    """
+    from ..actions import make_action, references_in, validate_action
+    from ..config import ACTIONS
+    from ..tools import REGISTRY
+
+    complaint, triage, case_id = state["complaint"], state["triage"], state["case_id"]
+    author, text = complaint["author"], complaint["text"]
+
+    # 1. Context, through the READ tool.
+    references = references_in(text)
+    amounts = _rupee_amounts(text)
+    queries = [{"handle": author, "reference": ref} for ref in references]
+    queries += [{"handle": author, "amount_inr": a} for a in amounts]
+
+    matches: dict[str, dict] = {}
+    tool_errors: list[str] = []
+    for q in queries:
+        result = await REGISTRY.call("lookup_transaction", q, agent="plan", trace_id=case_id)
+        if result.ok:
+            for m in result.output["matches"]:
+                matches[m["reference"]] = m
+        else:
+            tool_errors.append(f"{result.error.code.value}: {result.error.message}")
+
+    # 2. The model proposes.
+    r = route("plan")
+    ledger_view = json.dumps(list(matches.values()), ensure_ascii=False)
+    plan, cost = await structured(
+        model=r.model,
+        fallback_model=r.fallback,
+        system=with_trust_rules(_PLAN_SYSTEM),
+        user=(f"Complaint category: {triage['category']}, severity {triage['severity']}.\n\n"
+              + untrusted("customer_comment", minimal_text(text))
+              + "\n\nLedger results for this customer:\n"
+              + untrusted("tool_lookup_transaction", ledger_view)
+              + (f"\n\nThe ledger could not be checked: {'; '.join(tool_errors)}"
+                 if tool_errors else "")),
+        schema=ActionPlan,
+        temperature=0.0,
+        stage="plan",
+        offline_fallback=_offline_plan(list(matches.values()), tool_errors, amounts),
+        max_output_tokens=r.max_output_tokens,
+        timeout_s=r.timeout_s,
+        trace_id=case_id,
+    )
+
+    # 3. Code types, deduplicates and validates every proposal.
+    proposals, seen = [], set()
+
+    def add(kind: str, reason: str, reference=None, amount=None, proposed_by="plan") -> None:
+        action = make_action(kind, case_id=case_id, reason=reason, reference=reference,
+                             amount_inr=amount, proposed_by=proposed_by)
+        if action.id in seen:
+            return
+        seen.add(action.id)
+        validation = validate_action(action, author=author)
+        proposals.append({"proposal": action.model_dump(mode="json"),
+                          "validation": validation.model_dump(mode="json")})
+
+    for item in plan.actions:
+        if item.kind in ("reversal", "ticket"):
+            add(item.kind, item.reason, item.reference, item.amount_inr)
+
+    # A rule that must always hold does not depend on the model remembering it.
+    if (triage["severity"] >= ACTIONS.ticket_min_severity
+            and not any(p["proposal"]["kind"] == "ticket" for p in proposals)):
+        add("ticket", f"Severity {triage['severity']} {triage['category']} complaint: follow up",
+            proposed_by="rules")
+
+    summary = [
+        f"{p['proposal']['kind']}"
+        + (f" {p['proposal']['reference']} ₹{p['proposal']['amount_inr']:,.0f}"
+           if p["proposal"]["reference"] and p["proposal"]["amount_inr"] else "")
+        + (" valid" if p["validation"]["ok"] else
+           " BLOCKED: " + ", ".join(c["name"] for c in p["validation"]["checks"] if not c["passed"]))
+        for p in proposals
+    ]
+    message = "; ".join(summary) if summary else "no action proposed"
+    if tool_errors:
+        message += f" (ledger lookup failed: {tool_errors[0]})"
+    return {
+        "actions": proposals,
+        "costs": [cost],
+        "events": [event("plan", message, tool_errors=tool_errors)],
     }
 
 
@@ -607,14 +815,12 @@ def auto_post_allowed(state: GrievanceState) -> tuple[bool, str]:
     draft = state["draft"]
     grounding = state.get("grounding") or {}
 
-    if triage["severity"] > REVIEW.auto_post_max_severity:
-        return False, f"severity {triage['severity']} above auto-post ceiling {REVIEW.auto_post_max_severity}"
-    if REVIEW.require_grounded and not grounding.get("grounded"):
-        return False, "draft contains unsupported claims"
-    if REVIEW.forbid_auto_compensation and draft.get("promises_compensation"):
-        return False, "draft commits money; clause RFD-05 requires approval"
-    if triage.get("needs_private_data"):
-        return False, "resolution needs account data not available publicly"
+    # Ordered by consequence, so the reason a reviewer reads first is the one
+    # that matters most when several apply at once.
+    if any(a["proposal"]["risk"] == "write_high" for a in (state.get("actions") or [])):
+        # Including proposals that failed validation: a refused attempt to move
+        # someone else's money is exactly what a person should see.
+        return False, "a money-moving action is proposed; a human approves the exact action"
     if state.get("injection_flagged"):
         return False, "complaint contains instruction-like text; never auto-post"
     if (state.get("pattern") or {}).get("level") == "crisis":
@@ -625,6 +831,14 @@ def auto_post_allowed(state: GrievanceState) -> tuple[bool, str]:
     blocking = [g for g in (state.get("guardrails") or []) if g.get("severity") == "block"]
     if blocking:
         return False, f"guardrail block: {[g['rule'] for g in blocking]}"
+    if REVIEW.forbid_auto_compensation and draft.get("promises_compensation"):
+        return False, "draft commits money; clause RFD-05 requires approval"
+    if triage["severity"] > REVIEW.auto_post_max_severity:
+        return False, f"severity {triage['severity']} above auto-post ceiling {REVIEW.auto_post_max_severity}"
+    if REVIEW.require_grounded and not grounding.get("grounded"):
+        return False, "draft contains unsupported claims"
+    if triage.get("needs_private_data"):
+        return False, "resolution needs account data not available publicly"
     return True, "low severity, fully grounded, commits nothing"
 
 
@@ -651,6 +865,7 @@ async def review_gate_node(state: GrievanceState) -> dict:
         "citations": [c["clause_id"] for c in state["citations"]],
         "triage": state["triage"],
         "grounding": state.get("grounding"),
+        "actions": state.get("actions") or [],
     })
 
     review = Review(**decision) if isinstance(decision, dict) else Review(decision="reject")
@@ -686,7 +901,7 @@ async def review_gate_node(state: GrievanceState) -> dict:
 # ---------------------------------------------------------------------------
 
 async def publish_node(state: GrievanceState) -> dict:
-    from ..connectors import get_connector
+    from ..tools import REGISTRY
 
     review = state["review"]
     complaint = state["complaint"]
@@ -703,13 +918,87 @@ async def publish_node(state: GrievanceState) -> dict:
                              + "; ".join(v.detail for v in final_guard.violations))],
         }
 
-    connector = get_connector(complaint["channel"])
-    receipt = await connector.reply(complaint["external_id"], final_guard.text)
+    # Posting is a high-risk write. The approval is whoever cleared the review
+    # gate — the auto-post policy or a person — bound to this exact text.
+    args = {"channel": complaint["channel"], "external_id": complaint["external_id"],
+            "text": final_guard.text}
+    approval = REGISTRY.approval_for(
+        "post_reply", args, by=review.get("reviewer", "auto"),
+        human=not review.get("auto", False), note=review.get("note", ""))
+    result = await REGISTRY.call("post_reply", args, agent="publish", approval=approval,
+                                 trace_id=state["case_id"])
+    if not result.ok:
+        reason = f"{result.error.code.value}: {result.error.message}"
+        return {
+            "published": {"blocked": True, "reasons": [reason]},
+            "events": [event("publish", f"NOT posted — {reason}")],
+        }
 
+    receipt = result.output
     return {
         "published": receipt,
         "events": [event("publish", f"posted to {complaint['channel']}", **receipt)],
     }
+
+
+# ---------------------------------------------------------------------------
+# Act — the executor, which trusts neither the planner nor the reviewer
+# ---------------------------------------------------------------------------
+
+async def act_node(state: GrievanceState) -> dict:
+    """Carry out approved actions, re-validating each one first.
+
+    Validation already ran at planning time, and a human has looked since.
+    It runs again anyway: the ledger may have changed in the hours a case sat
+    in the queue, another case may have reversed the same debit, and an
+    executor that trusts an earlier layer's conclusion is only as safe as the
+    most stale thing it trusts.
+    """
+    from ..actions import ProposedAction, tool_args, validate_action
+    from ..tools import REGISTRY
+
+    review = state.get("review") or {}
+    decisions = review.get("actions") or {}
+    author = state["complaint"]["author"]
+    results, events = [], []
+
+    for item in state.get("actions") or []:
+        action = ProposedAction(**item["proposal"])
+        outcome = {"action_id": action.id, "kind": action.kind, "tool": action.tool,
+                   "risk": action.risk, "reference": action.reference,
+                   "amount_inr": action.amount_inr}
+
+        if action.risk == "write_high" and (review.get("auto") or decisions.get(action.id) != "approve"):
+            outcome.update(status="not_approved", detail="no human approval for this action")
+        else:
+            validation = validate_action(action, author=author)
+            if not validation.ok:
+                outcome.update(status="blocked",
+                               detail="; ".join(c.detail for c in validation.failed()))
+            else:
+                args = tool_args(action, triage=state["triage"])
+                approval = None
+                if action.risk == "write_high":
+                    approval = REGISTRY.approval_for(
+                        action.tool, args, by=review.get("reviewer", "human"), human=True,
+                        note=review.get("note", ""))
+                result = await REGISTRY.call(action.tool, args, agent="act",
+                                             approval=approval, trace_id=state["case_id"])
+                if result.ok:
+                    outcome.update(status="executed", output=result.output,
+                                   attempts=result.attempts)
+                else:
+                    outcome.update(status="failed",
+                                   detail=f"{result.error.code.value}: {result.error.message}")
+
+        results.append(outcome)
+        label = f"{action.kind}{' ' + action.reference if action.reference else ''}"
+        events.append(event("act", f"{label} — {outcome['status']}"
+                            + (f": {outcome['detail']}" if outcome.get("detail") else "")))
+
+    if not events:
+        events.append(event("act", "nothing to do"))
+    return {"action_results": results, "events": events}
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +1055,16 @@ async def escalation_node(state: GrievanceState) -> dict:
 _RUPEE_RE = re.compile(r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)", re.IGNORECASE)
 
 
+def _rupee_amounts(text: str) -> list[float]:
+    values = []
+    for m in _RUPEE_RE.finditer(text or ""):
+        try:
+            values.append(float(m.group(1).replace(",", "")))
+        except ValueError:
+            continue
+    return sorted(set(values))
+
+
 def _largest_rupee_amount(text: str) -> Optional[float]:
     values = []
     for m in _RUPEE_RE.finditer(text):
@@ -800,6 +1099,12 @@ async def voice_node(state: GrievanceState) -> dict:
             "category": state["triage"]["category"],
             "public_reply": state["review"]["final_text"],
             "clause_ids": [c["clause_id"] for c in state["citations"]],
+            # The call must not contradict what the system already did, any
+            # more than it may contradict what it already said.
+            "actions_taken": [
+                f"{r['kind']}{' ' + r['reference'] if r.get('reference') else ''}: {r['status']}"
+                for r in (state.get("action_results") or [])
+            ],
         },
     })
 
@@ -835,12 +1140,28 @@ async def close_node(state: GrievanceState) -> dict:
 
     resolved = bool(voice.get("resolved")) or not (state.get("escalation") or {}).get("needed")
 
+    # Count attempts, not cost entries. A call that needed a schema retry and a
+    # fallback is three calls on the invoice; the rules-based judge is none.
+    llm_calls = sum(
+        int(c["attempts"]) if "attempts" in c
+        else (0 if c.get("model") in NON_CALL_MODELS else 1)
+        for c in costs
+    )
+
+    results = state.get("action_results") or []
+    actions = {
+        status: [r["action_id"] for r in results if r.get("status") == status]
+        for status in ("executed", "blocked", "not_approved", "failed")
+    }
+
     return {
         "closure": {
             "resolved": resolved,
             "total_cost_usd": round(total_usd, 6),
             "total_cost_inr": round(total_inr, 4),
-            "llm_calls": len([c for c in costs if c.get("model") not in ("", "offline")]),
+            "llm_calls": llm_calls,
+            "degraded_steps": [c["stage"] for c in costs if c.get("degraded")],
+            "actions": actions,
             "consistency": receipt.model_dump(),
         },
         "events": [event(

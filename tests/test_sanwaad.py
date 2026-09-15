@@ -64,7 +64,8 @@ def test_ungrounded_draft_is_revised_then_handed_to_a_human():
     ungrounded = {"grounding": {"grounded": False}}
     assert _after_ground_check({**ungrounded, "revision_count": 1}) == "draft"
     # Two failures means the policy index lacks the answer. Stop burning tokens.
-    assert _after_ground_check({**ungrounded, "revision_count": 2}) == "review_gate"
+    # It goes on to planning and then the review gate, which holds it for a human.
+    assert _after_ground_check({**ungrounded, "revision_count": 2}) == "plan"
 
 
 # --- The auto-post gate ----------------------------------------------------

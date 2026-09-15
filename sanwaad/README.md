@@ -38,10 +38,14 @@ ghostwriter ──► ground_check ──┐  every claim must trace to a clause
         └──────────────────────┘
         │
         ▼
-  review_gate ── interrupt() ──► human approves in the console
-        │                        (crisis ALWAYS stops here)
+     plan ──► propose the fix (refund? ticket?) — code checks 9 rules
+        │
         ▼
-    publish ──► escalation ──► voice (WebRTC, same clauses) ──► close
+  review_gate ── interrupt() ──► a person approves the reply AND each money move
+        │                        (a crisis ALWAYS stops here)
+        ▼
+    publish ──► act ──► escalation ──► voice (WebRTC, same clauses) ──► close
+                 └─ re-checks every rule, then executes approved actions via tools
                                                                   │
                                           consistency receipt ◄────┘
                                           cost per resolution
@@ -56,7 +60,8 @@ only the model calls are stubbed.
 source .venv/bin/activate
 python -m sanwaad.demo          # CLI walkthrough
 python -m sanwaad.api.server    # console at http://localhost:7870
-pytest tests/ -q                # 102 tests, no key required
+python -m sanwaad.evals.trajectory  # 15 scenarios, graded step by step
+pytest tests/ -q                # no API key required
 ```
 
 First run downloads a ~470MB ONNX embedding model. Every later start is instant.
@@ -125,6 +130,57 @@ code, and a confirmed customer caught in a live incident gets a callback
 whatever their individual severity said — their problem is not small, it is
 early.
 
+## Production building blocks
+
+The agents are a small part of what makes this a system someone could rely on.
+[`DESIGN.md`](DESIGN.md) teaches each building block as a lesson; in brief:
+
+**Model layer.** `router.py` picks the cheapest model that can do each step and
+gives it a token cap, a timeout and a fallback. `llm.structured` treats the
+model as an unreliable dependency: output that fails its schema is retried
+once with the problem named, errors and timeouts move to the fallback model,
+and a step that still fails either runs a safe default marked `degraded` or
+raises. A grounding check that could not run is never read as "grounded".
+
+**Tools.** Four tools, one per rung of the risk ladder — `lookup_transaction`
+(read), `open_ticket` (low-risk write), `post_reply` and `initiate_reversal`
+(high-risk writes). Every call goes through `ToolRegistry.call`: does the tool
+exist, may this agent call it, are the arguments valid, is there an approval
+bound to these exact arguments, run with a timeout and retry only when safe,
+validate the output, write a redacted audit record. Each contract also exports
+as an MCP tool definition.
+
+**Approvals.** The model suggests; code validates; a person approves; the tool
+executes. For Karthik's ₹640 double debit, `plan` proposes reversing
+`NP-TXN-640-B`, `validate_action` runs nine named checks against the ledger
+(exists, owned by this author, identity verified, amount matches, eligible
+under RFD-06, under the ₹25,000 ceiling, not already reversed…), the console
+shows the proposal with every check, and `act` validates *again* before
+calling the tool, because the ledger may have changed while the case waited.
+Moving money can never be auto-approved.
+
+**Memory and state.** `python -m sanwaad.memory` prints eight stores —
+workflow state, the cross-case window, policy knowledge, dedupe ids, human
+corrections, traces, the tool audit log and the systems of record — with where
+each lives, how long it is kept, whether a model may see it, and what happens
+to personal data. Long-lived stores are redacted at write time.
+
+**Orchestration.** `agents.py` gives every agent a contract; the graph enforces
+that each node writes only its own keys and the registry enforces that each
+agent calls only its own tools.
+
+**Context.** Each step gets the smallest context that lets it decide.
+Customer text, model-written summaries and tool results arrive inside
+`<untrusted>` blocks that cannot be closed from inside, and every prompt
+carries the rule for reading them.
+
+**Evaluation.** `python -m sanwaad.evals.trajectory` runs 15 scenarios —
+happy path, ambiguous, out of scope, partial information, four policy edges,
+tool failure, two malicious inputs, two escalations, a live incident and a
+troll — and grades every step, not just the reply. A failure is reported at
+the first step that went wrong, and three safety invariants are checked on
+every run.
+
 ## The three ideas worth stealing
 
 **1. The consistency receipt.** Support organisations' real failure is not a
@@ -161,6 +217,7 @@ testable without spending a token.
 | judge | rules | free, every inbound item |
 | judge, second opinion | `gemini-2.5-flash-lite` | only the ambiguous band |
 | draft + grounding | `gemini-2.5-flash` | genuine complaints only |
+| plan | `gemini-2.5-flash` | complaints being answered; every proposal checked by code |
 | retrieval | local ONNX | free, every turn, both channels |
 | voice | Sarvam STT + Gemini + Murf | escalations only |
 
@@ -182,7 +239,7 @@ in one comparable number rather than two dashboards.
 ## Safety posture
 
 Auto-posting is deliberately hard to earn: severity ≤ 2, fully grounded, no
-money promised, no private data needed, **and no crisis in progress**.
+money promised, no private data needed, no crisis in progress, **and no money-moving action proposed**.
 Everything else waits for a human.
 An LLM posting an unsupervised apology about someone's money is the failure
 mode that ends a pilot. `SANWAAD_ALLOW_POSTING` gates writes to real
@@ -205,6 +262,13 @@ sanwaad/
   listener.py       multi-channel polling, dedupe, untagged-mention detection
   judge.py          author scoring — signals, bands, the reply-worthy rule
   pattern.py        the cross-case window, clustering, crisis levels
+  agents.py         agent contracts: role, writes, tools
+  actions.py        proposed fixes and the checks they must pass
+  context.py        minimal, trust-separated prompt context
+  memory.py         the memory map and retention
+  tools/            contracts, registry, built-in tools, mock ledger
+  evals/            golden set, retrieval eval, trajectory eval, harness
+  DESIGN.md         the course: agentic system design through this code
   consistency.py    the receipt, and the contradiction table
   graph/            state, nodes, edges
   rag/              clause parsing, local ONNX embeddings, hybrid retrieval

@@ -107,12 +107,16 @@ class ReviewRequest(BaseModel):
     final_text: Optional[str] = None
     reviewer: str = "human"
     note: str = ""
+    actions: dict[str, str] = {}   # action_id -> approve | reject
 
 
 @app.post("/api/cases/{case_id}/review")
 async def api_review(case_id: str, req: ReviewRequest):
     if req.decision not in ("approve", "edit", "reject"):
         raise HTTPException(400, "decision must be approve, edit or reject")
+    bad = {k: v for k, v in req.actions.items() if v not in ("approve", "reject")}
+    if bad:
+        raise HTTPException(400, f"each action decision must be approve or reject: {bad}")
     out = await resume_case(case_id, req.model_dump())
     return {"case_id": case_id, "pending": out["pending"],
             "state": _thin(out["state"])}

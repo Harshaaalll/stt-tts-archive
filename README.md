@@ -22,8 +22,9 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env          # every key is optional
 
-python -m sanwaad.demo        # Sanwaad CLI walkthrough, no key needed
-python -m sanwaad.api.server  # review console at http://localhost:7870
+python -m sanwaad.demo              # Sanwaad CLI walkthrough, no key needed
+python -m sanwaad.api.server        # review console at http://localhost:7870
+python -m sanwaad.evals.trajectory  # grade every step of 15 scenarios
 pytest tests/ -q
 
 python deepgram_gemini_murf/server.py   # a bake-off agent, port 7860
@@ -72,10 +73,14 @@ ghostwriter ──► ground_check ──┐  every claim must trace to a clause
         └──────────────────────┘
         │
         ▼
-  review_gate ── interrupt() ──► human approves in the console
+     plan ──► propose the fix (refund? ticket?) — code checks 9 rules
+        │
+        ▼
+  review_gate ── interrupt() ──► a person approves the reply AND each money move
         │                        (a crisis ALWAYS stops here)
         ▼
-    publish ──► escalation ──► voice (WebRTC, same clauses) ──► close
+    publish ──► act ──► escalation ──► voice (WebRTC, same clauses) ──► close
+                 └─ re-checks every rule, then executes approved actions via tools
                                                                   │
                                           consistency receipt ◄────┘
 ```
@@ -83,7 +88,7 @@ ghostwriter ──► ground_check ──┐  every claim must trace to a clause
 ```bash
 python -m sanwaad.demo        # CLI walkthrough, no API key needed
 python -m sanwaad.api.server  # review console at http://localhost:7870
-pytest tests/ -q              # 102 tests, no key required
+pytest tests/ -q              # no API key required
 ```
 
 With no keys at all the graph, retrieval, gating and receipts are all real —
@@ -97,6 +102,12 @@ model; every later start is instant.
 | `sanwaad/listener.py` | Multi-channel polling, dedupe, untagged-mention detection |
 | `sanwaad/judge.py` | Author scoring — signals, bands, the reply-worthy rule |
 | `sanwaad/pattern.py` | The cross-case window, clustering, crisis levels |
+| `sanwaad/tools/` | Tool contracts, the risk ladder, the one registry every call goes through |
+| `sanwaad/actions.py` | Validation for proposed fixes — nine named checks against the ledger |
+| `sanwaad/agents.py` | Each agent's role, the state it may write, the tools it may call |
+| `sanwaad/context.py` | Minimal context per step; customer text fenced off from instructions |
+| `sanwaad/memory.py` | Eight memory stores: where, how long, and whether a model may see them |
+| `sanwaad/evals/trajectory.py` | Trace-level evaluation: 15 scenarios graded step by step |
 | `sanwaad/graph/` | State, nodes and edges — the phase machine |
 | `sanwaad/rag/` | Clause parsing, local ONNX embeddings, RRF fusion, agentic retrieval |
 | `sanwaad/policy/` | The knowledge base — plain markdown, `## [ID] Heading` |
@@ -133,6 +144,24 @@ function respectively — adding them cost roughly nothing per comment and
 has to be earned — severity ≤ 2, fully grounded, no money promised, no private
 data needed, no crisis in progress — and `SANWAAD_ALLOW_POSTING` gates writes
 to real platforms, defaulting to off.
+
+**Built as a production agentic system.** The agents are the visible part.
+Around them, every building block a production agent needs has a home in the
+code and a test that proves it:
+
+| Building block | In Sanwaad |
+|---|---|
+| Model routing and failure handling | cheap models for classification; timeouts, schema retries, fallback models, visible `degraded` steps |
+| Tool contracts | typed inputs and outputs, READ → WRITE_LOW → WRITE_HIGH, least privilege per agent, redacted audit log |
+| Approvals | the model suggests a refund, code runs nine checks, a person approves the exact amount, the executor checks again |
+| Memory and state | eight stores chosen by access pattern, each with retention and a rule for what reaches a model |
+| Orchestration | an explicit graph with retry loops, approval pauses, fallback paths and enforced agent contracts |
+| Evaluation | every step of 15 scenarios graded, failures attributed to the first wrong step, three safety invariants |
+| Context, security, privacy | minimal context, untrusted text fenced off, identifiers never sent to a model or kept in long-lived logs |
+
+[`sanwaad/DESIGN.md`](sanwaad/DESIGN.md) teaches each block as a lesson
+through this code — what the idea is, where it lives, the decision behind it,
+a command to run and a question to check yourself.
 
 Full detail, including the cost table and the layout, in
 [`sanwaad/README.md`](sanwaad/README.md).
@@ -230,6 +259,18 @@ window. All three are free per comment — I/O, a scoring function, and a dot
 product against embeddings retrieval already computed. Details in
 [`sanwaad/README.md`](sanwaad/README.md).
 
+**Agentic system design, made explicit** (2026-09-15)
+The agents worked; the system around them was implicit. This pass gave every
+production building block a home and a test: a model layer that treats the
+LLM as an unreliable dependency, tools with contracts and a risk ladder, a
+planner whose refund proposals are validated by code and approved by a person
+before an executor re-checks and runs them, a memory map with retention,
+prompts that fence untrusted text off from instructions, enforced agent
+contracts, and a trace-level eval over 15 scenarios. The eval's first run
+caught a triage bug the golden set had carried since it was written, and
+writing the memory map exposed raw phone numbers in the cross-case window.
+[`sanwaad/DESIGN.md`](sanwaad/DESIGN.md) teaches each block through the code.
+
 ## Configuration
 
 `.env.example` documents the Sanwaad variables. The bake-off agents read
@@ -247,7 +288,11 @@ sanwaad/            the current project (own README)
   listener.py       hears every platform, tagged or not
   judge.py          reads who is speaking
   pattern.py        counts how many are saying it
-  graph/            the state machine that writes and escalates
+  tools/            what agents may do in the world, and under what approval
+  actions.py        the rules a proposed fix must pass
+  evals/            retrieval and trajectory evaluation
+  DESIGN.md         agentic system design, taught through this code
+  graph/            the state machine that writes, acts and escalates
 tests/              pytest suite for the Sanwaad layer
 prompt_blocks/      composable system-prompt blocks
 <stt>_<llm>_<tts>/  one directory per pipeline combination

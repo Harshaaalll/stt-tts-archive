@@ -163,6 +163,8 @@ sanwaad/data/sanwaad.sqlite
 sanwaad/data/mock_replies.json
 sanwaad/data/pattern_memory.json
 sanwaad/data/listener_seen.json
+sanwaad/data/tool_audit.jsonl
+sanwaad/data/mock_backend.json
 sanwaad/data/traces.jsonl
 sanwaad/data/feedback.jsonl
 

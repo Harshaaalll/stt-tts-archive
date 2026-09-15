@@ -206,10 +206,11 @@ def check_reply(text: str, *, allowed_clause_ids: list[str] | None = None) -> Gu
 def check_complaint(text: str) -> tuple[str, list[Violation]]:
     """INPUT guardrail. Returns (text_safe_to_prompt_with, violations).
 
-    The complaint is not redacted before triage — severity genuinely depends on
-    the amount, and stripping "₹18,000" would blind the classifier. What we do
-    is neutralise instructions aimed at the model and flag them, so an injection
-    attempt lands in the human queue instead of the auto-post path.
+    This flags instruction-shaped text so an injection attempt lands in the
+    human queue instead of the auto-post path. It does not redact: that happens
+    at the model boundary (`context.minimal_text`), which strips identifiers but
+    keeps amounts — severity genuinely depends on "₹18,000", and nothing a
+    model decides here depends on a phone number.
     """
     violations = []
     hits = detect_injection(text)

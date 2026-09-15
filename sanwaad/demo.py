@@ -15,10 +15,14 @@ from __future__ import annotations
 import asyncio
 import sys
 
+import json
+
 from .listener import SEEN_PATH, Listener
 from .llm import is_offline
 from .pattern import MEMORY_PATH
 from .pipeline import resume_case, run_case
+from .tools import registry as tool_registry
+from .tools.ledger import BACKEND
 
 BOLD, DIM, GREEN, YELLOW, RED, CYAN, RESET = (
     "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[36m", "\033[0m",
@@ -34,8 +38,9 @@ def rule(title: str = "") -> None:
 
 
 def _reset_memory() -> None:
-    for path in (MEMORY_PATH, SEEN_PATH):
+    for path in (MEMORY_PATH, SEEN_PATH, tool_registry.AUDIT_PATH):
         path.unlink(missing_ok=True)
+    BACKEND.reset()
 
 
 async def main() -> int:
@@ -148,6 +153,43 @@ async def main() -> int:
     print(f"    shared     {con['shared_clauses']}")
     print(f"    text only  {con['text_only']}")
     print(f"    voice only {con['voice_only']}")
+
+    # 7 -----------------------------------------------------------------
+    k_complaint, k_out = next((c, o) for c, o in results if c.author == "u/karthik_rn")
+    rule(f"7. PLAN → VALIDATE → APPROVE → EXECUTE — {k_complaint.author}")
+    print(f"  {k_complaint.text}\n")
+    for item in k_out["state"].get("actions", []):
+        p, v = item["proposal"], item["validation"]
+        head = p["kind"] + (f" {p['reference']} ₹{p['amount_inr']:,.0f}" if p.get("reference") else "")
+        print(f"  {BOLD}{head}{RESET}  {DIM}{p['risk']} · proposed by {p['proposed_by']}{RESET}")
+        for c in v["checks"]:
+            mark = f"{GREEN}✓{RESET}" if c["passed"] else f"{RED}✗{RESET}"
+            print(f"    {mark} {c['name']:<22}{DIM}{c['detail']}{RESET}")
+    if k_out["pending"]:
+        print(f"\n  {RED}HELD{RESET} — {k_out['pending']['reason']}")
+        print(f"  {DIM}The model proposed it and code validated it. A person now approves the "
+              f"reply and each money action separately, bound to the exact reference and amount.{RESET}")
+        approve = {i["proposal"]["id"]: "approve" for i in k_out["state"].get("actions", [])
+                   if i["proposal"]["risk"] == "write_high" and i["validation"]["ok"]}
+        k_out = await resume_case(k_out["case_id"], {
+            "decision": "approve", "reviewer": "demo", "note": "approved in demo", "actions": approve,
+        })
+    for r in k_out["state"].get("action_results", []):
+        detail = r.get("output") or r.get("detail") or ""
+        print(f"  → {r['kind']}: {BOLD}{r['status']}{RESET}  {DIM}{detail}{RESET}")
+
+    # 8 -----------------------------------------------------------------
+    rule("8. EVERY TOOL CALL, AUDITED")
+    audit = []
+    if tool_registry.AUDIT_PATH.exists():
+        audit = [json.loads(line) for line in tool_registry.AUDIT_PATH.read_text().splitlines()]
+    mine = [a for a in audit if a.get("trace_id") == k_out["case_id"]]
+    for a in mine:
+        who = ("human" if a["human_approved"] else "policy") if a["human_approved"] is not None else "—"
+        outcome = f"{GREEN}ok{RESET}" if a["ok"] else f"{RED}{a['error_code']}{RESET}"
+        print(f"  {a['agent']:<8}{a['tool']:<20}{a['risk']:<12}approved by {who:<7} {outcome}")
+    print(f"  {DIM}{len(audit)} tool calls across the whole feed, every one with its agent, "
+          f"arguments (redacted) and approval.{RESET}")
 
     rule("TIMELINE")
     for e in state["events"]:

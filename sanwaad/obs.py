@@ -24,6 +24,7 @@ import json
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +47,9 @@ class Span:
     ended: Optional[float] = None
     attrs: dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    # Wall-clock start. perf_counter is right for durations and useless for
+    # "delete spans older than 30 days", which is a retention requirement.
+    at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     @property
     def ms(self) -> float:
@@ -58,6 +62,7 @@ class Span:
 
     def to_dict(self) -> dict:
         return {
+            "at": self.at,
             "trace_id": self.trace_id, "span_id": self.span_id,
             "parent_id": self.parent_id, "name": self.name,
             "ms": round(self.ms, 2), "error": self.error, **self.attrs,

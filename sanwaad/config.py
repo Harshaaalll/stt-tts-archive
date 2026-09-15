@@ -149,3 +149,17 @@ class CrisisPolicy:
 
 
 CRISIS = CrisisPolicy()
+
+
+@dataclass(frozen=True)
+class ActionPolicy:
+    """Limits on what the executor may do, however the approval was obtained."""
+
+    # Above this, a reversal is not an agent-desk decision at all; it goes to
+    # the nodal officer (ESC-04) whoever approves it in the console.
+    reversal_ceiling_inr: float = 25_000.0
+    # Severity at which the planner opens an internal ticket for a complaint.
+    ticket_min_severity: int = 3
+
+
+ACTIONS = ActionPolicy()

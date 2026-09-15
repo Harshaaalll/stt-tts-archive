@@ -50,6 +50,10 @@
   .cost { font-family:var(--mono); font-size:20px; color:var(--ok); }
   .muted { color:var(--dim); }
   a { color:var(--accent); }
+  .action { padding:10px 0; border-top:1px solid rgba(127,127,127,.22); }
+  .action:first-of-type { border-top:0; }
+  .checks { font-size:12px; line-height:1.55; opacity:.9; }
+  .approve { display:block; margin-top:8px; font-size:13px; }
 </style>
 </head>
 <body>
@@ -163,6 +167,31 @@ async function open_(id) {
         ${s.review.auto ? "auto-approved" : "reviewed by " + esc(s.review.reviewer)} — ${esc(s.review.note)}</p>`:""}
     </div>`}
 
+    ${(s.actions||[]).length ? `
+    <div class="card"><h3>Proposed actions${awaitingReview ? " — approve each one separately" : ""}</h3>
+      ${(s.actions||[]).map(a => {
+        const p = a.proposal, v = a.validation;
+        const res = (s.action_results||[]).find(r => r.action_id === p.id);
+        const canApprove = awaitingReview && p.risk === "write_high" && v.ok;
+        return `<div class="action">
+          <div class="row">
+            <span class="pill ${v.ok ? 'ok' : 's5'}">${v.ok ? 'valid' : 'blocked'}</span>
+            <span class="pill">${esc(p.kind)}</span>
+            <span class="pill">${esc(p.risk.replace('_', ' '))}</span>
+            ${p.reference ? `<b>${esc(p.reference)}</b>` : ''}
+            ${p.amount_inr ? `₹${Number(p.amount_inr).toLocaleString('en-IN')}` : ''}
+            ${res ? `<span class="pill ${res.status === 'executed' ? 'ok' : 's3'}">${esc(res.status)}</span>` : ''}
+          </div>
+          <p class="muted" style="margin:6px 0;font-size:12px">${esc(p.reason)} · proposed by ${esc(p.proposed_by)}</p>
+          <div class="checks">${v.checks.map(c =>
+            `<div>${c.passed ? '✓' : '✗'} <b>${esc(c.name)}</b> ${esc(c.detail)}</div>`).join("")}</div>
+          ${canApprove ? `<label class="approve"><input type="checkbox" class="act-approve"
+             data-id="${esc(p.id)}"> Approve this exact ${esc(p.kind)}</label>` : ''}
+          ${res && res.detail ? `<p class="muted" style="font-size:12px;margin:6px 0 0">${esc(res.detail)}</p>` : ''}
+        </div>`;
+      }).join("")}
+    </div>` : ""}
+
     ${awaitingVoice ? `
     <div class="card"><h3>Voice escalation pending</h3>
       <p style="margin:0 0 10px">${(s.escalation?.reasons||[]).map(esc).join("<br>")}</p>
@@ -199,7 +228,9 @@ async function review(id, decision) {
   const ta = document.getElementById("draft");
   status("submitting…");
   await fetch(`/api/cases/${id}/review`, {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({decision, final_text: ta ? ta.value : null, reviewer:"you"})});
+    body: JSON.stringify({decision, final_text: ta ? ta.value : null, reviewer:"you",
+      actions: Object.fromEntries([...document.querySelectorAll(".act-approve")]
+        .map(cb => [cb.dataset.id, cb.checked ? "approve" : "reject"]))})});
   status("done"); open_(id); load();
 }
 

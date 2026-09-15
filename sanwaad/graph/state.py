@@ -30,7 +30,9 @@ class GrievanceState(TypedDict, total=False):
     injection_flagged: bool
     grounding: Optional[dict]        # GroundingVerdict
     revision_count: int
+    actions: list[dict]              # [{proposal: ProposedAction, validation: Validation}]
     review: Optional[dict]           # Review
+    action_results: list[dict]       # what the executor did with each proposal
     published: Optional[dict]
     escalation: Optional[dict]
     voice: Optional[dict]            # VoiceOutcome

@@ -31,6 +31,7 @@ from difflib import SequenceMatcher
 from typing import Iterable, Optional
 
 from .config import CRISIS, DATA_DIR
+from .guardrails import redact
 from .models import PatternSignal
 
 MEMORY_PATH = DATA_DIR / "pattern_memory.json"
@@ -273,11 +274,16 @@ def detect(
 
     vector = list(embed_one(summary or text))
     signal = assess_cluster(vector=vector, author=author, at=at, neighbours=neighbours)
-    duplicates = coordinated_authors(text or summary, author, neighbours)
+
+    # The window is cross-case memory that outlives the case, so it holds the
+    # redacted text only. Redaction is deterministic, so two copy-pasted
+    # comments still match each other after it.
+    clean = redact(text or "")[0]
+    duplicates = coordinated_authors(clean or summary, author, neighbours)
 
     store.add(Fingerprint(
         case_id=case_id, author=author, category=category, summary=summary,
-        at=at.isoformat(), vector=[round(v, 5) for v in vector], text=text[:300],
+        at=at.isoformat(), vector=[round(v, 5) for v in vector], text=clean[:300],
     ))
     return signal, duplicates
 

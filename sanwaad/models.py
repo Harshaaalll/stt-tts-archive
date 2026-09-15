@@ -145,6 +145,7 @@ class GroundingVerdict(BaseModel):
     grounded: bool
     unsupported_claims: list[str] = Field(default_factory=list)
     reasoning: str = ""
+    unavailable: bool = False   # the checker could not run: nothing was verified
 
 
 class Review(BaseModel):
@@ -154,6 +155,9 @@ class Review(BaseModel):
     note: str = ""
     decided_at: str = Field(default_factory=_now)
     auto: bool = False
+    # action_id -> approve | reject. Separate from the reply decision: a
+    # reviewer can post the reply and still refuse the refund, or the reverse.
+    actions: dict[str, Literal["approve", "reject"]] = Field(default_factory=dict)
 
 
 class VoiceOutcome(BaseModel):

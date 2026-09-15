@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from .config import DATA_DIR
+from .guardrails import redact
 
 FEEDBACK_PATH = DATA_DIR / "feedback.jsonl"
 
@@ -77,13 +78,24 @@ class FeedbackRecord:
         return difflib.SequenceMatcher(a=self.norm(self.draft), b=self.norm(self.final)).ratio()
 
 
-def record(fb: FeedbackRecord, path: Path = FEEDBACK_PATH) -> None:
+def record(fb: FeedbackRecord, path: Optional[Path] = None) -> None:
+    """Append one correction, with identifiers redacted.
+
+    This file is kept for a year and mined for few-shot examples, so it is
+    long-term memory — and long-term memory is the wrong place for a phone
+    number. The diff a reviewer made survives redaction; the identifier does not.
+    """
+    path = path or FEEDBACK_PATH
+    row = asdict(fb)
+    for key in ("complaint", "draft", "final"):
+        row[key] = redact(row.get(key) or "")[0]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(asdict(fb), ensure_ascii=False) + "\n")
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def load(path: Path = FEEDBACK_PATH) -> list[FeedbackRecord]:
+def load(path: Optional[Path] = None) -> list[FeedbackRecord]:
+    path = path or FEEDBACK_PATH
     if not path.exists():
         return []
     out = []
